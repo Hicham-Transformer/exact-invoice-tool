@@ -98,7 +98,14 @@ def sync():
         return redirect("/login")
 
     headers = {"Authorization": f"Bearer {token}"}
-    division = "110"
+    # juiste division ophalen van Exact zelf
+me_res = requests.get(f"{BASE_URL}/current/Me", headers=headers)
+
+if me_res.status_code != 200:
+    return f"Fout bij ophalen division: {me_res.text}"
+
+me_data = me_res.json()
+division = str(me_data["d"]["results"][0]["CurrentDivision"])
 
     url = f"{BASE_URL}/{division}/purchaseentry/PurchaseEntries?$top=100"
 
