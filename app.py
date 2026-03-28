@@ -1,7 +1,7 @@
 from flask import Flask, redirect, request, session, send_file
 import os
+import re
 from io import BytesIO
-import traceback
 
 import pandas as pd
 import requests
@@ -55,139 +55,138 @@ def login():
 
 @app.route("/callback")
 def callback():
+    code = request.args.get("code")
+    error = request.args.get("error")
+
+    if error:
+        return f"Exact gaf een fout terug: {error}", 400
+
+    if not code:
+        return "Geen authorization code ontvangen van Exact.", 400
+
+    data = {
+        "grant_type": "authorization_code",
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "code": code,
+        "redirect_uri": REDIRECT_URI,
+    }
+
+    response = requests.post(TOKEN_URL, data=data, timeout=30)
+
     try:
-        code = request.args.get("code")
-        error = request.args.get("error")
-
-        if error:
-            return f"Exact gaf een fout terug: {error}", 400
-
-        if not code:
-            return "Geen authorization code ontvangen van Exact.", 400
-
-        data = {
-            "grant_type": "authorization_code",
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "code": code,
-            "redirect_uri": REDIRECT_URI,
-        }
-
-        response = requests.post(TOKEN_URL, data=data, timeout=30)
-
-        try:
-            token = response.json()
-        except Exception:
-            return f"Token response niet leesbaar: {response.text}", 400
-
-        access_token = token.get("access_token")
-        refresh_token = token.get("refresh_token")
-
-        if not access_token:
-            return f"Geen access token ontvangen: {token}", 400
-
-        session["access_token"] = access_token
-        session["refresh_token"] = refresh_token
-
-        return redirect("/sync")
-
+        token = response.json()
     except Exception:
-        return f"<pre>{traceback.format_exc()}</pre>", 500
+        return f"Token response niet leesbaar: {response.text}", 400
+
+    access_token = token.get("access_token")
+    refresh_token = token.get("refresh_token")
+
+    if not access_token:
+        return f"Geen access token ontvangen: {token}", 400
+
+    session["access_token"] = access_token
+    session["refresh_token"] = refresh_token
+
+    return redirect("/sync")
 
 
 @app.route("/sync")
 def sync():
+    token = session.get("access_token")
+
+    if not token:
+        return redirect("/login")
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+
+    # Probeer current division op te halen
+    me_res = requests.get(f"{BASE_URL}/current/Me", headers=headers, timeout=30)
+
+    if me_res.status_code != 200:
+        return f"Fout bij ophalen division: {me_res.text}", 400
+
+    division = None
+
+    # Eerst JSON proberen
     try:
-        token = session.get("access_token")
+        me_data = me_res.json()
+        division = str(me_data["d"]["results"][0]["CurrentDivision"])
+    except Exception:
+        pass
 
-        if not token:
-            return redirect("/login")
+    # Fallback: XML/text parsen
+    if not division:
+        text = me_res.text
+        match = re.search(r"<d:CurrentDivision>(\d+)</d:CurrentDivision>", text)
+        if match:
+            division = match.group(1)
 
-        headers = {"Authorization": f"Bearer {token}"}
+    if not division:
+        return f"Division niet gevonden in response: {me_res.text}", 400
 
-        # Juiste division ophalen
-        me_res = requests.get(f"{BASE_URL}/current/Me", headers=headers, timeout=30)
+    url = f"{BASE_URL}/{division}/purchaseentry/PurchaseEntries?$top=100"
+    response = requests.get(url, headers=headers, timeout=30)
 
-        if me_res.status_code != 200:
-            return f"Fout bij ophalen division: {me_res.text}", 400
+    if response.status_code != 200:
+        return f"Fout bij ophalen PurchaseEntries: {response.text}", 400
+
+    try:
+        res = response.json()
+    except Exception:
+        return f"Exact response niet leesbaar: {response.text}", 400
+
+    results = []
+
+    for item in res.get("d", {}).get("results", []):
+        leverancier = item.get("SupplierName", "") or str(item.get("Supplier", ""))
+        totaal = item.get("AmountDC", 0) or 0
+        factuur = item.get("InvoiceNumber", "") or ""
+        datum = item.get("EntryDate", "") or ""
 
         try:
-            me_data = me_res.json()
+            prijs_per_kg = float(totaal)
         except Exception:
-            return f"Current/Me response niet leesbaar: {me_res.text}", 400
+            prijs_per_kg = 0
 
-        results_block = me_data.get("d", {}).get("results", [])
-        if not results_block:
-            return f"Geen division gevonden in Current/Me: {me_data}", 400
-
-        division = str(results_block[0].get("CurrentDivision"))
-        if not division:
-            return f"CurrentDivision ontbreekt: {me_data}", 400
-
-        url = f"{BASE_URL}/{division}/purchaseentry/PurchaseEntries?$top=100"
-
-        response = requests.get(url, headers=headers, timeout=30)
-
-        if response.status_code != 200:
-            return f"Fout bij ophalen PurchaseEntries: {response.text}", 400
-
-        try:
-            res = response.json()
-        except Exception:
-            return f"Exact response niet leesbaar: {response.text}", 400
-
-        rows = res.get("d", {}).get("results", [])
-        results = []
-
-        for item in rows:
-            leverancier = item.get("SupplierName", "") or str(item.get("Supplier", ""))
-            totaal = item.get("AmountDC", 0) or 0
-            factuur = item.get("InvoiceNumber", "") or ""
-            datum = item.get("EntryDate", "") or ""
-
-            try:
-                prijs_per_kg = float(totaal)
-            except Exception:
-                prijs_per_kg = 0
-
-            results.append(
-                {
-                    "Factuurnummer": factuur,
-                    "Datum": datum,
-                    "Leverancier": leverancier,
-                    "Totaal": totaal,
-                    "KG": 1,
-                    "Prijs/kg": prijs_per_kg,
-                }
-            )
-
-        if not results:
-            results.append(
-                {
-                    "Factuurnummer": "",
-                    "Datum": "",
-                    "Leverancier": "Geen resultaten gevonden",
-                    "Totaal": 0,
-                    "KG": 0,
-                    "Prijs/kg": 0,
-                }
-            )
-
-        df = pd.DataFrame(results)
-
-        output = BytesIO()
-        df.to_excel(output, index=False, engine="openpyxl")
-        output.seek(0)
-
-        return send_file(
-            output,
-            download_name="exact_invoices.xlsx",
-            as_attachment=True,
-            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        results.append(
+            {
+                "Factuurnummer": factuur,
+                "Datum": datum,
+                "Leverancier": leverancier,
+                "Totaal": totaal,
+                "KG": 1,
+                "Prijs/kg": prijs_per_kg,
+            }
         )
 
-    except Exception:
-        return f"<pre>{traceback.format_exc()}</pre>", 500
+    if not results:
+        results.append(
+            {
+                "Factuurnummer": "",
+                "Datum": "",
+                "Leverancier": "Geen resultaten gevonden",
+                "Totaal": 0,
+                "KG": 0,
+                "Prijs/kg": 0,
+            }
+        )
+
+    df = pd.DataFrame(results)
+
+    output = BytesIO()
+    df.to_excel(output, index=False, engine="openpyxl")
+    output.seek(0)
+
+    return send_file(
+        output,
+        download_name="exact_invoices.xlsx",
+        as_attachment=True,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 if __name__ == "__main__":
