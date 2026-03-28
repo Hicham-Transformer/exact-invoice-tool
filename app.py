@@ -18,6 +18,47 @@ TOKEN_URL = "https://start.exactonline.nl/api/oauth2/token"
 BASE_URL = "https://start.exactonline.nl/api/v1"
 
 
+def fetch_all_pages(first_url: str, headers: dict) -> list:
+    results = []
+    url = first_url
+
+    while url:
+        response = requests.get(url, headers=headers, timeout=60)
+
+        if response.status_code != 200:
+            raise RuntimeError(f"Fout bij ophalen pagina: {response.text}")
+
+        data = response.json()
+        page_results = data.get("d", {}).get("results", [])
+        results.extend(page_results)
+
+        url = data.get("d", {}).get("__next")
+
+    return results
+
+
+def get_current_division(headers: dict) -> str:
+    me_res = requests.get(f"{BASE_URL}/current/Me", headers=headers, timeout=30)
+
+    if me_res.status_code != 200:
+        raise RuntimeError(f"Fout bij ophalen division: {me_res.text}")
+
+    # Eerst JSON proberen
+    try:
+        me_data = me_res.json()
+        return str(me_data["d"]["results"][0]["CurrentDivision"])
+    except Exception:
+        pass
+
+    # Fallback op XML/text
+    text = me_res.text
+    match = re.search(r"<d:CurrentDivision>(\d+)</d:CurrentDivision>", text)
+    if match:
+        return match.group(1)
+
+    raise RuntimeError(f"Division niet gevonden: {me_res.text}")
+
+
 @app.route("/")
 def home():
     return """
@@ -93,106 +134,126 @@ def callback():
 
 @app.route("/sync")
 def sync():
-    token = session.get("access_token")
-
-    if not token:
-        return redirect("/login")
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-    }
-
-    # 👉 juiste division ophalen
-    me_res = requests.get(f"{BASE_URL}/current/Me", headers=headers, timeout=30)
-
-    if me_res.status_code != 200:
-        return f"Fout bij ophalen division: {me_res.text}", 400
-
-    division = None
-
-    # eerst JSON proberen
     try:
-        me_data = me_res.json()
-        division = str(me_data["d"]["results"][0]["CurrentDivision"])
-    except Exception:
-        pass
+        token = session.get("access_token")
 
-    # fallback XML parsing
-    if not division:
-        text = me_res.text
-        match = re.search(r"<d:CurrentDivision>(\d+)</d:CurrentDivision>", text)
-        if match:
-            division = match.group(1)
+        if not token:
+            return redirect("/login")
 
-    if not division:
-        return f"Division niet gevonden: {me_res.text}", 400
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
 
-    # 👉 FIX: $select toegevoegd (belangrijk!)
-    url = (
-        f"{BASE_URL}/{division}/purchaseentry/PurchaseEntries"
-        f"?$select=InvoiceNumber,EntryDate,AmountDC,SupplierName"
-        f"&$top=100"
-    )
+        division = get_current_division(headers)
 
-    response = requests.get(url, headers=headers, timeout=30)
-
-    if response.status_code != 200:
-        return f"Fout bij ophalen PurchaseEntries: {response.text}", 400
-
-    try:
-        res = response.json()
-    except Exception:
-        return f"Exact response niet leesbaar: {response.text}", 400
-
-    results = []
-
-    for item in res.get("d", {}).get("results", []):
-        leverancier = item.get("SupplierName", "")
-        totaal = item.get("AmountDC", 0)
-        factuur = item.get("InvoiceNumber", "")
-        datum = item.get("EntryDate", "")
-
-        try:
-            prijs_per_kg = float(totaal)
-        except Exception:
-            prijs_per_kg = 0
-
-        results.append(
-            {
-                "Factuurnummer": factuur,
-                "Datum": datum,
-                "Leverancier": leverancier,
-                "Totaal": totaal,
-                "KG": 1,
-                "Prijs/kg": prijs_per_kg,
-            }
+        # Meer velden ophalen + pagination
+        first_url = (
+            f"{BASE_URL}/{division}/purchaseentry/PurchaseEntries"
+            f"?$select="
+            f"EntryID,"
+            f"InvoiceNumber,"
+            f"EntryNumber,"
+            f"EntryDate,"
+            f"AmountDC,"
+            f"AmountFC,"
+            f"Currency,"
+            f"Supplier,"
+            f"SupplierName,"
+            f"Description,"
+            f"YourRef,"
+            f"OrderNumber,"
+            f"DueDate,"
+            f"Journal,"
+            f"PaymentCondition,"
+            f"Created,"
+            f"Modified"
+            f"&$top=60"
         )
 
-    if not results:
-        results.append(
-            {
-                "Factuurnummer": "",
-                "Datum": "",
-                "Leverancier": "Geen resultaten gevonden",
-                "Totaal": 0,
-                "KG": 0,
-                "Prijs/kg": 0,
-            }
+        all_rows = fetch_all_pages(first_url, headers)
+
+        results = []
+
+        for item in all_rows:
+            leverancier = (item.get("SupplierName") or "").strip()
+
+            # Alleen Mission Freight
+            if "mission freight" not in leverancier.lower():
+                continue
+
+            totaal_dc = item.get("AmountDC", 0)
+            totaal_fc = item.get("AmountFC", 0)
+
+            try:
+                prijs_per_kg = float(totaal_dc) if totaal_dc is not None else 0
+            except Exception:
+                prijs_per_kg = 0
+
+            results.append(
+                {
+                    "Factuurnummer": item.get("InvoiceNumber", ""),
+                    "Boekingsnummer": item.get("EntryNumber", ""),
+                    "EntryID": item.get("EntryID", ""),
+                    "Factuurdatum": item.get("EntryDate", ""),
+                    "Leverancier": leverancier,
+                    "Leverancier ID": item.get("Supplier", ""),
+                    "Omschrijving": item.get("Description", ""),
+                    "Referentie": item.get("YourRef", ""),
+                    "Ordernummer": item.get("OrderNumber", ""),
+                    "Vervaldatum": item.get("DueDate", ""),
+                    "Dagboek": item.get("Journal", ""),
+                    "Betalingsconditie": item.get("PaymentCondition", ""),
+                    "Valuta": item.get("Currency", ""),
+                    "Totaal DC": totaal_dc,
+                    "Totaal FC": totaal_fc,
+                    "KG": 1,
+                    "Prijs/kg": prijs_per_kg,
+                    "Aangemaakt": item.get("Created", ""),
+                    "Gewijzigd": item.get("Modified", ""),
+                }
+            )
+
+        if not results:
+            results.append(
+                {
+                    "Factuurnummer": "",
+                    "Boekingsnummer": "",
+                    "EntryID": "",
+                    "Factuurdatum": "",
+                    "Leverancier": "Geen Mission Freight facturen gevonden",
+                    "Leverancier ID": "",
+                    "Omschrijving": "",
+                    "Referentie": "",
+                    "Ordernummer": "",
+                    "Vervaldatum": "",
+                    "Dagboek": "",
+                    "Betalingsconditie": "",
+                    "Valuta": "",
+                    "Totaal DC": 0,
+                    "Totaal FC": 0,
+                    "KG": 0,
+                    "Prijs/kg": 0,
+                    "Aangemaakt": "",
+                    "Gewijzigd": "",
+                }
+            )
+
+        df = pd.DataFrame(results)
+
+        output = BytesIO()
+        df.to_excel(output, index=False, engine="openpyxl")
+        output.seek(0)
+
+        return send_file(
+            output,
+            download_name="exact_invoices.xlsx",
+            as_attachment=True,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-    df = pd.DataFrame(results)
-
-    output = BytesIO()
-    df.to_excel(output, index=False, engine="openpyxl")
-    output.seek(0)
-
-    return send_file(
-        output,
-        download_name="exact_invoices.xlsx",
-        as_attachment=True,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    except Exception as e:
+        return f"Fout in sync: {str(e)}", 500
 
 
 if __name__ == "__main__":
