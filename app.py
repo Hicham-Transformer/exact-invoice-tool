@@ -17,33 +17,62 @@ AUTH_URL = "https://start.exactonline.nl/api/oauth2/auth"
 TOKEN_URL = "https://start.exactonline.nl/api/oauth2/token"
 BASE_URL = "https://start.exactonline.nl/api/v1"
 
+MISSION_FREIGHT_NAME = "mission freight"
 
-def fetch_all_pages(first_url: str, headers: dict) -> list:
-    results = []
-    url = first_url
 
-    while url:
+def exact_date_to_text(value):
+    if not value:
+        return ""
+    if isinstance(value, str):
+        m = re.search(r"/Date\((\d+)", value)
+        if m:
+            try:
+                return pd.to_datetime(int(m.group(1)), unit="ms").strftime("%Y-%m-%d")
+            except Exception:
+                return value
+    return str(value)
+
+
+def extract_results(data):
+    d = data.get("d")
+    if isinstance(d, dict):
+        return d.get("results", [])
+    if isinstance(d, list):
+        return d
+    return []
+
+
+def fetch_all_pages(base_url: str, headers: dict, page_size: int = 60) -> list:
+    all_rows = []
+    skip = 0
+
+    while True:
+        joiner = "&" if "?" in base_url else "?"
+        url = f"{base_url}{joiner}$top={page_size}&$skip={skip}"
+
         response = requests.get(url, headers=headers, timeout=60)
 
         if response.status_code != 200:
             raise RuntimeError(f"Fout bij ophalen pagina: {response.text}")
 
-        data = response.json()
-        d = data.get("d")
+        try:
+            data = response.json()
+        except Exception:
+            raise RuntimeError(f"Response niet leesbaar: {response.text}")
 
-        if isinstance(d, dict):
-            page_results = d.get("results", [])
-            url = d.get("__next")
-        elif isinstance(d, list):
-            page_results = d
-            url = None
-        else:
-            page_results = []
-            url = None
+        page_rows = extract_results(data)
 
-        results.extend(page_results)
+        if not page_rows:
+            break
 
-    return results
+        all_rows.extend(page_rows)
+
+        if len(page_rows) < page_size:
+            break
+
+        skip += page_size
+
+    return all_rows
 
 
 def get_current_division(headers: dict) -> str:
@@ -75,6 +104,10 @@ def get_current_division(headers: dict) -> str:
         raise RuntimeError(f"Division niet gevonden: {me_res.text}")
 
     return division
+
+
+def is_mission_freight(name: str) -> bool:
+    return MISSION_FREIGHT_NAME in (name or "").strip().lower()
 
 
 @app.route("/")
@@ -165,7 +198,7 @@ def sync():
 
         division = get_current_division(headers)
 
-        first_url = (
+        purchase_entries_url = (
             f"{BASE_URL}/{division}/purchaseentry/PurchaseEntries"
             f"?$select="
             f"EntryID,"
@@ -185,16 +218,34 @@ def sync():
             f"PaymentCondition,"
             f"Created,"
             f"Modified"
-            f"&$top=60"
         )
 
-        all_rows = fetch_all_pages(first_url, headers)
+        purchase_invoices_url = (
+            f"{BASE_URL}/{division}/purchaseinvoice/PurchaseInvoices"
+            f"?$select="
+            f"InvoiceID,"
+            f"InvoiceNumber,"
+            f"InvoiceDate,"
+            f"AmountDC,"
+            f"AmountFC,"
+            f"Currency,"
+            f"Supplier,"
+            f"SupplierName,"
+            f"Description,"
+            f"YourRef,"
+            f"DueDate,"
+            f"Created,"
+            f"Modified"
+        )
+
+        entry_rows = fetch_all_pages(purchase_entries_url, headers)
+        invoice_rows = fetch_all_pages(purchase_invoices_url, headers)
+
         results = []
 
-        for item in all_rows:
+        for item in entry_rows:
             leverancier = (item.get("SupplierName") or "").strip()
-
-            if "mission freight" not in leverancier.lower():
+            if not is_mission_freight(leverancier):
                 continue
 
             totaal_dc = item.get("AmountDC", 0)
@@ -207,16 +258,17 @@ def sync():
 
             results.append(
                 {
+                    "Bron": "PurchaseEntries",
                     "Factuurnummer": item.get("InvoiceNumber", ""),
                     "Boekingsnummer": item.get("EntryNumber", ""),
-                    "EntryID": item.get("EntryID", ""),
-                    "Factuurdatum": item.get("EntryDate", ""),
+                    "Document ID": item.get("EntryID", ""),
+                    "Factuurdatum": exact_date_to_text(item.get("EntryDate", "")),
                     "Leverancier": leverancier,
                     "Leverancier ID": item.get("Supplier", ""),
                     "Omschrijving": item.get("Description", ""),
                     "Referentie": item.get("YourRef", ""),
                     "Ordernummer": item.get("OrderNumber", ""),
-                    "Vervaldatum": item.get("DueDate", ""),
+                    "Vervaldatum": exact_date_to_text(item.get("DueDate", "")),
                     "Dagboek": item.get("Journal", ""),
                     "Betalingsconditie": item.get("PaymentCondition", ""),
                     "Valuta": item.get("Currency", ""),
@@ -224,17 +276,56 @@ def sync():
                     "Totaal FC": totaal_fc,
                     "KG": 1,
                     "Prijs/kg": prijs_per_kg,
-                    "Aangemaakt": item.get("Created", ""),
-                    "Gewijzigd": item.get("Modified", ""),
+                    "Aangemaakt": exact_date_to_text(item.get("Created", "")),
+                    "Gewijzigd": exact_date_to_text(item.get("Modified", "")),
+                }
+            )
+
+        for item in invoice_rows:
+            leverancier = (item.get("SupplierName") or "").strip()
+            if not is_mission_freight(leverancier):
+                continue
+
+            totaal_dc = item.get("AmountDC", 0)
+            totaal_fc = item.get("AmountFC", 0)
+
+            try:
+                prijs_per_kg = float(totaal_dc) if totaal_dc is not None else 0
+            except Exception:
+                prijs_per_kg = 0
+
+            results.append(
+                {
+                    "Bron": "PurchaseInvoices",
+                    "Factuurnummer": item.get("InvoiceNumber", ""),
+                    "Boekingsnummer": "",
+                    "Document ID": item.get("InvoiceID", ""),
+                    "Factuurdatum": exact_date_to_text(item.get("InvoiceDate", "")),
+                    "Leverancier": leverancier,
+                    "Leverancier ID": item.get("Supplier", ""),
+                    "Omschrijving": item.get("Description", ""),
+                    "Referentie": item.get("YourRef", ""),
+                    "Ordernummer": "",
+                    "Vervaldatum": exact_date_to_text(item.get("DueDate", "")),
+                    "Dagboek": "",
+                    "Betalingsconditie": "",
+                    "Valuta": item.get("Currency", ""),
+                    "Totaal DC": totaal_dc,
+                    "Totaal FC": totaal_fc,
+                    "KG": 1,
+                    "Prijs/kg": prijs_per_kg,
+                    "Aangemaakt": exact_date_to_text(item.get("Created", "")),
+                    "Gewijzigd": exact_date_to_text(item.get("Modified", "")),
                 }
             )
 
         if not results:
             results.append(
                 {
+                    "Bron": "",
                     "Factuurnummer": "",
                     "Boekingsnummer": "",
-                    "EntryID": "",
+                    "Document ID": "",
                     "Factuurdatum": "",
                     "Leverancier": "Geen Mission Freight facturen gevonden",
                     "Leverancier ID": "",
@@ -255,6 +346,24 @@ def sync():
             )
 
         df = pd.DataFrame(results)
+
+        # Duplicaten eruit op bron + factuurnummer + bedrag + datum
+        if not df.empty and "Geen Mission Freight facturen gevonden" not in str(df.iloc[0].get("Leverancier", "")):
+            df["_dedupe_key"] = (
+                df["Bron"].astype(str).fillna("")
+                + "|"
+                + df["Factuurnummer"].astype(str).fillna("")
+                + "|"
+                + df["Factuurdatum"].astype(str).fillna("")
+                + "|"
+                + df["Totaal DC"].astype(str).fillna("")
+            )
+            df = df.drop_duplicates(subset=["_dedupe_key"]).drop(columns=["_dedupe_key"])
+
+        # Sortering
+        sort_cols = [c for c in ["Factuurdatum", "Factuurnummer", "Bron"] if c in df.columns]
+        if sort_cols:
+            df = df.sort_values(by=sort_cols, ascending=[False] * len(sort_cols))
 
         output = BytesIO()
         df.to_excel(output, index=False, engine="openpyxl")
