@@ -1,7 +1,7 @@
 from flask import Flask, redirect, request, session, send_file
 import os
-import re
 from io import BytesIO
+import re
 
 import pandas as pd
 import requests
@@ -16,8 +16,6 @@ REDIRECT_URI = os.environ.get("EXACT_REDIRECT_URI")
 AUTH_URL = "https://start.exactonline.nl/api/oauth2/auth"
 TOKEN_URL = "https://start.exactonline.nl/api/oauth2/token"
 BASE_URL = "https://start.exactonline.nl/api/v1"
-
-MISSION_FREIGHT_NAME = "mission freight"
 
 
 def exact_date_to_text(value):
@@ -115,19 +113,6 @@ def get_division(headers):
         raise RuntimeError(f"Division niet gevonden: {res.text[:500]}")
 
     return division
-
-
-def is_mission_freight(name):
-    return MISSION_FREIGHT_NAME in (name or "").strip().lower()
-
-
-def build_entries_map(entry_rows):
-    entries_map = {}
-    for item in entry_rows:
-        entry_id = str(item.get("EntryID") or "")
-        if entry_id:
-            entries_map[entry_id] = item
-    return entries_map
 
 
 @app.route("/")
@@ -260,236 +245,97 @@ def sync():
             f"Modified"
         )
 
-        purchase_entry_lines_url = (
-            f"{BASE_URL}/{division}/purchaseentry/PurchaseEntryLines"
-            f"?$select="
-            f"ID,"
-            f"EntryID,"
-            f"LineNumber,"
-            f"Description,"
-            f"AmountDC,"
-            f"AmountFC,"
-            f"ItemCode,"
-            f"ItemDescription,"
-            f"Quantity,"
-            f"UnitCode"
-        )
-
         entry_rows = fetch_all_pages(purchase_entries_url, headers, page_size=20)
         invoice_rows = fetch_all_pages(purchase_invoices_url, headers, page_size=20)
-        line_rows = fetch_all_pages(purchase_entry_lines_url, headers, page_size=20)
 
-        entries_map = build_entries_map(entry_rows)
         results = []
 
         for item in entry_rows:
-            leverancier = (item.get("SupplierName") or "").strip()
-            if not is_mission_freight(leverancier):
-                continue
-
-            totaal_dc = item.get("AmountDC", 0)
-            totaal_fc = item.get("AmountFC", 0)
-
-            try:
-                prijs_per_kg = float(totaal_dc) if totaal_dc is not None else 0
-            except Exception:
-                prijs_per_kg = 0
-
             results.append(
                 {
                     "Bron": "PurchaseEntries",
                     "Factuurnummer": item.get("InvoiceNumber", ""),
                     "Boekingsnummer": item.get("EntryNumber", ""),
                     "Document ID": item.get("EntryID", ""),
-                    "Regel ID": "",
-                    "Regelnummer": "",
                     "Factuurdatum": exact_date_to_text(item.get("EntryDate", "")),
-                    "Leverancier": leverancier,
+                    "Leverancier": item.get("SupplierName", ""),
                     "Leverancier ID": item.get("Supplier", ""),
                     "Omschrijving": item.get("Description", ""),
-                    "Regelomschrijving": "",
-                    "ItemCode": "",
-                    "ItemOmschrijving": "",
-                    "Aantal": "",
-                    "Eenheid": "",
                     "Referentie": item.get("YourRef", ""),
                     "Ordernummer": item.get("OrderNumber", ""),
                     "Vervaldatum": exact_date_to_text(item.get("DueDate", "")),
                     "Dagboek": item.get("Journal", ""),
                     "Betalingsconditie": item.get("PaymentCondition", ""),
                     "Valuta": item.get("Currency", ""),
-                    "Totaal DC": totaal_dc,
-                    "Totaal FC": totaal_fc,
-                    "Regel Totaal DC": "",
-                    "Regel Totaal FC": "",
-                    "KG": 1,
-                    "Prijs/kg": prijs_per_kg,
+                    "Totaal DC": item.get("AmountDC", 0),
+                    "Totaal FC": item.get("AmountFC", 0),
                     "Aangemaakt": exact_date_to_text(item.get("Created", "")),
                     "Gewijzigd": exact_date_to_text(item.get("Modified", "")),
                 }
             )
 
         for item in invoice_rows:
-            leverancier = (item.get("SupplierName") or "").strip()
-            if not is_mission_freight(leverancier):
-                continue
-
-            totaal_dc = item.get("AmountDC", 0)
-            totaal_fc = item.get("AmountFC", 0)
-
-            try:
-                prijs_per_kg = float(totaal_dc) if totaal_dc is not None else 0
-            except Exception:
-                prijs_per_kg = 0
-
             results.append(
                 {
                     "Bron": "PurchaseInvoices",
                     "Factuurnummer": item.get("InvoiceNumber", ""),
                     "Boekingsnummer": "",
                     "Document ID": item.get("InvoiceID", ""),
-                    "Regel ID": "",
-                    "Regelnummer": "",
                     "Factuurdatum": exact_date_to_text(item.get("InvoiceDate", "")),
-                    "Leverancier": leverancier,
+                    "Leverancier": item.get("SupplierName", ""),
                     "Leverancier ID": item.get("Supplier", ""),
                     "Omschrijving": item.get("Description", ""),
-                    "Regelomschrijving": "",
-                    "ItemCode": "",
-                    "ItemOmschrijving": "",
-                    "Aantal": "",
-                    "Eenheid": "",
                     "Referentie": item.get("YourRef", ""),
                     "Ordernummer": "",
                     "Vervaldatum": exact_date_to_text(item.get("DueDate", "")),
                     "Dagboek": "",
                     "Betalingsconditie": "",
                     "Valuta": item.get("Currency", ""),
-                    "Totaal DC": totaal_dc,
-                    "Totaal FC": totaal_fc,
-                    "Regel Totaal DC": "",
-                    "Regel Totaal FC": "",
-                    "KG": 1,
-                    "Prijs/kg": prijs_per_kg,
+                    "Totaal DC": item.get("AmountDC", 0),
+                    "Totaal FC": item.get("AmountFC", 0),
                     "Aangemaakt": exact_date_to_text(item.get("Created", "")),
                     "Gewijzigd": exact_date_to_text(item.get("Modified", "")),
                 }
             )
 
-        for item in line_rows:
-            entry_id = str(item.get("EntryID") or "")
-            header = entries_map.get(entry_id, {})
-
-            leverancier = (header.get("SupplierName") or "").strip()
-            if not is_mission_freight(leverancier):
-                continue
-
-            totaal_dc = header.get("AmountDC", 0)
-            totaal_fc = header.get("AmountFC", 0)
-            regel_dc = item.get("AmountDC", 0)
-            regel_fc = item.get("AmountFC", 0)
-
-            try:
-                prijs_per_kg = float(regel_dc) if regel_dc is not None else 0
-            except Exception:
-                prijs_per_kg = 0
-
-            results.append(
-                {
-                    "Bron": "PurchaseEntryLines",
-                    "Factuurnummer": header.get("InvoiceNumber", ""),
-                    "Boekingsnummer": header.get("EntryNumber", ""),
-                    "Document ID": entry_id,
-                    "Regel ID": item.get("ID", ""),
-                    "Regelnummer": item.get("LineNumber", ""),
-                    "Factuurdatum": exact_date_to_text(header.get("EntryDate", "")),
-                    "Leverancier": leverancier,
-                    "Leverancier ID": header.get("Supplier", ""),
-                    "Omschrijving": header.get("Description", ""),
-                    "Regelomschrijving": item.get("Description", ""),
-                    "ItemCode": item.get("ItemCode", ""),
-                    "ItemOmschrijving": item.get("ItemDescription", ""),
-                    "Aantal": item.get("Quantity", ""),
-                    "Eenheid": item.get("UnitCode", ""),
-                    "Referentie": header.get("YourRef", ""),
-                    "Ordernummer": header.get("OrderNumber", ""),
-                    "Vervaldatum": exact_date_to_text(header.get("DueDate", "")),
-                    "Dagboek": header.get("Journal", ""),
-                    "Betalingsconditie": header.get("PaymentCondition", ""),
-                    "Valuta": header.get("Currency", ""),
-                    "Totaal DC": totaal_dc,
-                    "Totaal FC": totaal_fc,
-                    "Regel Totaal DC": regel_dc,
-                    "Regel Totaal FC": regel_fc,
-                    "KG": item.get("Quantity", 1) or 1,
-                    "Prijs/kg": prijs_per_kg,
-                    "Aangemaakt": exact_date_to_text(header.get("Created", "")),
-                    "Gewijzigd": exact_date_to_text(header.get("Modified", "")),
-                }
-            )
-
         if not results:
-            results.append(
-                {
-                    "Bron": "",
-                    "Factuurnummer": "",
-                    "Boekingsnummer": "",
-                    "Document ID": "",
-                    "Regel ID": "",
-                    "Regelnummer": "",
-                    "Factuurdatum": "",
-                    "Leverancier": "Geen Mission Freight facturen gevonden",
-                    "Leverancier ID": "",
-                    "Omschrijving": "",
-                    "Regelomschrijving": "",
-                    "ItemCode": "",
-                    "ItemOmschrijving": "",
-                    "Aantal": "",
-                    "Eenheid": "",
-                    "Referentie": "",
-                    "Ordernummer": "",
-                    "Vervaldatum": "",
-                    "Dagboek": "",
-                    "Betalingsconditie": "",
-                    "Valuta": "",
-                    "Totaal DC": 0,
-                    "Totaal FC": 0,
-                    "Regel Totaal DC": "",
-                    "Regel Totaal FC": "",
-                    "KG": 0,
-                    "Prijs/kg": 0,
-                    "Aangemaakt": "",
-                    "Gewijzigd": "",
-                }
-            )
+            return "Geen facturen gevonden via Exact API"
 
         df = pd.DataFrame(results)
 
-        if not df.empty and "Geen Mission Freight facturen gevonden" not in str(df.iloc[0].get("Leverancier", "")):
-            df["_dedupe_key"] = (
-                df["Bron"].astype(str).fillna("")
-                + "|"
-                + df["Factuurnummer"].astype(str).fillna("")
-                + "|"
-                + df["Factuurdatum"].astype(str).fillna("")
-                + "|"
-                + df["Document ID"].astype(str).fillna("")
-                + "|"
-                + df["Regelnummer"].astype(str).fillna("")
-            )
-            df = df.drop_duplicates(subset=["_dedupe_key"]).drop(columns=["_dedupe_key"])
+        # Duplicaten eruit
+        df["_dedupe_key"] = (
+            df["Bron"].astype(str).fillna("")
+            + "|"
+            + df["Factuurnummer"].astype(str).fillna("")
+            + "|"
+            + df["Factuurdatum"].astype(str).fillna("")
+            + "|"
+            + df["Totaal DC"].astype(str).fillna("")
+        )
+        df = df.drop_duplicates(subset=["_dedupe_key"]).drop(columns=["_dedupe_key"])
 
-        sort_cols = [c for c in ["Factuurdatum", "Factuurnummer", "Bron", "Regelnummer"] if c in df.columns]
-        if sort_cols:
-            df = df.sort_values(by=sort_cols, ascending=[False] * len(sort_cols))
+        # Sorteer
+        df = df.sort_values(by=["Factuurdatum", "Factuurnummer"], ascending=[False, False])
+
+        # Extra sheet met leveranciersoverzicht
+        leveranciers_df = (
+            df.groupby(["Leverancier", "Leverancier ID"], dropna=False)
+            .size()
+            .reset_index(name="Aantal facturen")
+            .sort_values(by="Aantal facturen", ascending=False)
+        )
 
         output = BytesIO()
-        df.to_excel(output, index=False, engine="openpyxl")
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="Alle facturen", index=False)
+            leveranciers_df.to_excel(writer, sheet_name="Leveranciers", index=False)
+
         output.seek(0)
 
         return send_file(
             output,
-            download_name="exact_invoices_enterprise.xlsx",
+            download_name="exact_invoices_all.xlsx",
             as_attachment=True,
             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
