@@ -29,10 +29,19 @@ def fetch_all_pages(first_url: str, headers: dict) -> list:
             raise RuntimeError(f"Fout bij ophalen pagina: {response.text}")
 
         data = response.json()
-        page_results = data.get("d", {}).get("results", [])
-        results.extend(page_results)
+        d = data.get("d")
 
-        url = data.get("d", {}).get("__next")
+        if isinstance(d, dict):
+            page_results = d.get("results", [])
+            url = d.get("__next")
+        elif isinstance(d, list):
+            page_results = d
+            url = None
+        else:
+            page_results = []
+            url = None
+
+        results.extend(page_results)
 
     return results
 
@@ -43,20 +52,29 @@ def get_current_division(headers: dict) -> str:
     if me_res.status_code != 200:
         raise RuntimeError(f"Fout bij ophalen division: {me_res.text}")
 
-    # Eerst JSON proberen
+    division = None
+
     try:
         me_data = me_res.json()
-        return str(me_data["d"]["results"][0]["CurrentDivision"])
+        d = me_data.get("d")
+
+        if isinstance(d, dict) and d.get("results"):
+            division = str(d["results"][0]["CurrentDivision"])
+        elif isinstance(d, list) and len(d) > 0:
+            division = str(d[0]["CurrentDivision"])
     except Exception:
         pass
 
-    # Fallback op XML/text
-    text = me_res.text
-    match = re.search(r"<d:CurrentDivision>(\d+)</d:CurrentDivision>", text)
-    if match:
-        return match.group(1)
+    if not division:
+        text = me_res.text
+        match = re.search(r"<d:CurrentDivision>(\d+)</d:CurrentDivision>", text)
+        if match:
+            division = match.group(1)
 
-    raise RuntimeError(f"Division niet gevonden: {me_res.text}")
+    if not division:
+        raise RuntimeError(f"Division niet gevonden: {me_res.text}")
+
+    return division
 
 
 @app.route("/")
@@ -147,7 +165,6 @@ def sync():
 
         division = get_current_division(headers)
 
-        # Meer velden ophalen + pagination
         first_url = (
             f"{BASE_URL}/{division}/purchaseentry/PurchaseEntries"
             f"?$select="
@@ -172,13 +189,11 @@ def sync():
         )
 
         all_rows = fetch_all_pages(first_url, headers)
-
         results = []
 
         for item in all_rows:
             leverancier = (item.get("SupplierName") or "").strip()
 
-            # Alleen Mission Freight
             if "mission freight" not in leverancier.lower():
                 continue
 
