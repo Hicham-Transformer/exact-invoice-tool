@@ -37,8 +37,8 @@ def home():
 def login():
     if not CLIENT_ID or not CLIENT_SECRET or not REDIRECT_URI:
         return (
-            "Environment variables ontbreken. "
-            "Zet EXACT_CLIENT_ID, EXACT_CLIENT_SECRET en EXACT_REDIRECT_URI in Render.",
+            "Environment variables ontbreken. Zet EXACT_CLIENT_ID, "
+            "EXACT_CLIENT_SECRET en EXACT_REDIRECT_URI in Render.",
             500,
         )
 
@@ -47,8 +47,7 @@ def login():
         f"?client_id={CLIENT_ID}"
         f"&redirect_uri={REDIRECT_URI}"
         f"&response_type=code"
-        f"&scope=offline_access"
-        f"&force_login=0"
+        f"&scope=exactonlineapi%20offline_access"
     )
     return redirect(url)
 
@@ -99,13 +98,9 @@ def sync():
         return redirect("/login")
 
     headers = {"Authorization": f"Bearer {token}"}
-
     division = "110"
 
-    url = (
-        f"{BASE_URL}/{division}/purchaseentry/PurchaseEntries"
-        f"?$top=100"
-    )
+    url = f"{BASE_URL}/{division}/purchaseentry/PurchaseEntries?$top=100"
 
     response = requests.get(url, headers=headers, timeout=30)
 
