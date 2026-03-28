@@ -1,7 +1,7 @@
 from flask import Flask, redirect, request, session, send_file
 import os
-from io import BytesIO
 import re
+from io import BytesIO
 
 import pandas as pd
 import requests
@@ -17,21 +17,27 @@ AUTH_URL = "https://start.exactonline.nl/api/oauth2/auth"
 TOKEN_URL = "https://start.exactonline.nl/api/oauth2/token"
 BASE_URL = "https://start.exactonline.nl/api/v1"
 
+TARGET_SUPPLIER = "mission freight"
+
+
+def normalize(text):
+    return (text or "").strip().lower()
+
+
+def is_mission_freight(name):
+    return TARGET_SUPPLIER in normalize(name)
+
 
 def exact_date_to_text(value):
     if not value:
         return ""
-    if isinstance(value, str):
-        m = re.search(r"/Date\((\d+)", value)
-        if m:
-            try:
-                return pd.to_datetime(int(m.group(1)), unit="ms").strftime("%Y-%m-%d")
-            except Exception:
-                return value
+    m = re.search(r"/Date\((\d+)", str(value))
+    if m:
+        return pd.to_datetime(int(m.group(1)), unit="ms").strftime("%Y-%m-%d")
     return str(value)
 
 
-def parse_exact_results(data):
+def parse_exact(data):
     if isinstance(data, dict):
         d = data.get("d")
         if isinstance(d, dict):
@@ -41,105 +47,59 @@ def parse_exact_results(data):
     return []
 
 
-def fetch_all_pages(base_url, headers, page_size=20, max_pages=500):
-    all_rows = []
+def fetch_all(url, headers):
+    results = []
     skip = 0
-    page_count = 0
 
-    while page_count < max_pages:
-        joiner = "&" if "?" in base_url else "?"
-        url = f"{base_url}{joiner}$top={page_size}&$skip={skip}"
-
-        res = requests.get(url, headers=headers, timeout=60)
+    while True:
+        full_url = f"{url}&$top=50&$skip={skip}"
+        res = requests.get(full_url, headers=headers, timeout=60)
 
         if res.status_code != 200:
-            print("HTTP error:", res.status_code, res.text[:300])
-            break
-
-        if not res.text or not res.text.strip():
-            print("Lege response op:", url)
+            print("ERROR:", res.text[:300])
             break
 
         try:
             data = res.json()
         except Exception:
-            print("JSON parse error op:", url)
-            print("Response preview:", res.text[:300])
+            print("JSON FAIL:", res.text[:300])
             break
 
-        rows = parse_exact_results(data)
+        rows = parse_exact(data)
 
         if not rows:
             break
 
-        all_rows.extend(rows)
+        results.extend(rows)
 
-        if len(rows) < page_size:
+        if len(rows) < 50:
             break
 
-        skip += page_size
-        page_count += 1
+        skip += 50
 
-    return all_rows
+    return results
 
 
 def get_division(headers):
-    res = requests.get(f"{BASE_URL}/current/Me", headers=headers, timeout=30)
-
-    if res.status_code != 200:
-        raise RuntimeError(f"Fout bij ophalen division: {res.text}")
-
-    if not res.text or not res.text.strip():
-        raise RuntimeError("Lege response bij ophalen division")
-
-    division = None
+    res = requests.get(f"{BASE_URL}/current/Me", headers=headers)
 
     try:
         data = res.json()
-        d = data.get("d")
-        if isinstance(d, dict) and d.get("results"):
-            division = str(d["results"][0]["CurrentDivision"])
-        elif isinstance(d, list) and len(d) > 0:
-            division = str(d[0]["CurrentDivision"])
+        return str(data["d"]["results"][0]["CurrentDivision"])
     except Exception:
-        pass
-
-    if not division:
-        match = re.search(r"<d:CurrentDivision>(\d+)</d:CurrentDivision>", res.text)
-        if match:
-            division = match.group(1)
-
-    if not division:
-        raise RuntimeError(f"Division niet gevonden: {res.text[:500]}")
-
-    return division
+        raise Exception("Division ophalen mislukt")
 
 
 @app.route("/")
 def home():
     return """
-    <html>
-      <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Exact Invoice Tool</title>
-      </head>
-      <body style="font-family: Arial, sans-serif; padding: 24px;">
-        <h2>Exact Invoice Tool</h2>
-        <p><a href="/login">Login met Exact & download facturen</a></p>
-      </body>
-    </html>
+    <h2>Exact Invoice Tool</h2>
+    <a href="/login">Login met Exact</a>
     """
 
 
 @app.route("/login")
 def login():
-    if not CLIENT_ID or not CLIENT_SECRET or not REDIRECT_URI:
-        return (
-            "Environment variables ontbreken. Zet EXACT_CLIENT_ID, "
-            "EXACT_CLIENT_SECRET en EXACT_REDIRECT_URI in Render.",
-            500,
-        )
-
     url = (
         f"{AUTH_URL}"
         f"?client_id={CLIENT_ID}"
@@ -153,13 +113,6 @@ def login():
 @app.route("/callback")
 def callback():
     code = request.args.get("code")
-    error = request.args.get("error")
-
-    if error:
-        return f"Exact gaf een fout terug: {error}", 400
-
-    if not code:
-        return "Geen authorization code ontvangen van Exact.", 400
 
     data = {
         "grant_type": "authorization_code",
@@ -169,24 +122,11 @@ def callback():
         "redirect_uri": REDIRECT_URI,
     }
 
-    token_res = requests.post(TOKEN_URL, data=data, timeout=30)
+    res = requests.post(TOKEN_URL, data=data)
 
-    if not token_res.text or not token_res.text.strip():
-        return "Lege token response van Exact", 400
+    token = res.json()
 
-    try:
-        token = token_res.json()
-    except Exception:
-        return f"Token response niet leesbaar: {token_res.text}", 400
-
-    access_token = token.get("access_token")
-    refresh_token = token.get("refresh_token")
-
-    if not access_token:
-        return f"Geen access token ontvangen: {token}", 400
-
-    session["access_token"] = access_token
-    session["refresh_token"] = refresh_token
+    session["access_token"] = token["access_token"]
 
     return redirect("/sync")
 
@@ -195,155 +135,52 @@ def callback():
 def sync():
     try:
         token = session.get("access_token")
-        if not token:
-            return redirect("/login")
-
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-        }
+        headers = {"Authorization": f"Bearer {token}"}
 
         division = get_division(headers)
 
-        purchase_entries_url = (
-            f"{BASE_URL}/{division}/purchaseentry/PurchaseEntries"
-            f"?$select="
-            f"EntryID,"
-            f"InvoiceNumber,"
-            f"EntryNumber,"
-            f"EntryDate,"
-            f"AmountDC,"
-            f"AmountFC,"
-            f"Currency,"
-            f"Supplier,"
-            f"SupplierName,"
-            f"Description,"
-            f"YourRef,"
-            f"OrderNumber,"
-            f"DueDate,"
-            f"Journal,"
-            f"PaymentCondition,"
-            f"Created,"
-            f"Modified"
+        url = (
+            f"{BASE_URL}/{division}/purchaseentry/PurchaseEntries?"
+            f"$select=InvoiceNumber,EntryDate,AmountDC,SupplierName,Description"
         )
 
-        purchase_invoices_url = (
-            f"{BASE_URL}/{division}/purchaseinvoice/PurchaseInvoices"
-            f"?$select="
-            f"InvoiceID,"
-            f"InvoiceNumber,"
-            f"InvoiceDate,"
-            f"AmountDC,"
-            f"AmountFC,"
-            f"Currency,"
-            f"Supplier,"
-            f"SupplierName,"
-            f"Description,"
-            f"YourRef,"
-            f"DueDate,"
-            f"Created,"
-            f"Modified"
-        )
-
-        entry_rows = fetch_all_pages(purchase_entries_url, headers, page_size=20)
-        invoice_rows = fetch_all_pages(purchase_invoices_url, headers, page_size=20)
+        rows = fetch_all(url, headers)
 
         results = []
 
-        for item in entry_rows:
-            results.append(
-                {
-                    "Bron": "PurchaseEntries",
-                    "Factuurnummer": item.get("InvoiceNumber", ""),
-                    "Boekingsnummer": item.get("EntryNumber", ""),
-                    "Document ID": item.get("EntryID", ""),
-                    "Factuurdatum": exact_date_to_text(item.get("EntryDate", "")),
-                    "Leverancier": item.get("SupplierName", ""),
-                    "Leverancier ID": item.get("Supplier", ""),
-                    "Omschrijving": item.get("Description", ""),
-                    "Referentie": item.get("YourRef", ""),
-                    "Ordernummer": item.get("OrderNumber", ""),
-                    "Vervaldatum": exact_date_to_text(item.get("DueDate", "")),
-                    "Dagboek": item.get("Journal", ""),
-                    "Betalingsconditie": item.get("PaymentCondition", ""),
-                    "Valuta": item.get("Currency", ""),
-                    "Totaal DC": item.get("AmountDC", 0),
-                    "Totaal FC": item.get("AmountFC", 0),
-                    "Aangemaakt": exact_date_to_text(item.get("Created", "")),
-                    "Gewijzigd": exact_date_to_text(item.get("Modified", "")),
-                }
-            )
+        for r in rows:
+            leverancier = r.get("SupplierName", "")
 
-        for item in invoice_rows:
-            results.append(
-                {
-                    "Bron": "PurchaseInvoices",
-                    "Factuurnummer": item.get("InvoiceNumber", ""),
-                    "Boekingsnummer": "",
-                    "Document ID": item.get("InvoiceID", ""),
-                    "Factuurdatum": exact_date_to_text(item.get("InvoiceDate", "")),
-                    "Leverancier": item.get("SupplierName", ""),
-                    "Leverancier ID": item.get("Supplier", ""),
-                    "Omschrijving": item.get("Description", ""),
-                    "Referentie": item.get("YourRef", ""),
-                    "Ordernummer": "",
-                    "Vervaldatum": exact_date_to_text(item.get("DueDate", "")),
-                    "Dagboek": "",
-                    "Betalingsconditie": "",
-                    "Valuta": item.get("Currency", ""),
-                    "Totaal DC": item.get("AmountDC", 0),
-                    "Totaal FC": item.get("AmountFC", 0),
-                    "Aangemaakt": exact_date_to_text(item.get("Created", "")),
-                    "Gewijzigd": exact_date_to_text(item.get("Modified", "")),
-                }
-            )
+            if not is_mission_freight(leverancier):
+                continue
 
+            results.append({
+                "Factuurnummer": r.get("InvoiceNumber"),
+                "Datum": exact_date_to_text(r.get("EntryDate")),
+                "Leverancier": leverancier,
+                "Omschrijving": r.get("Description"),
+                "Totaal": r.get("AmountDC")
+            })
+
+        # 🔥 fallback zodat je nooit leeg blijft
         if not results:
-            return "Geen facturen gevonden via Exact API"
+            return "⚠️ Geen Mission Freight facturen gevonden — check naam in Exact"
 
         df = pd.DataFrame(results)
 
-        # Duplicaten eruit
-        df["_dedupe_key"] = (
-            df["Bron"].astype(str).fillna("")
-            + "|"
-            + df["Factuurnummer"].astype(str).fillna("")
-            + "|"
-            + df["Factuurdatum"].astype(str).fillna("")
-            + "|"
-            + df["Totaal DC"].astype(str).fillna("")
-        )
-        df = df.drop_duplicates(subset=["_dedupe_key"]).drop(columns=["_dedupe_key"])
-
-        # Sorteer
-        df = df.sort_values(by=["Factuurdatum", "Factuurnummer"], ascending=[False, False])
-
-        # Extra sheet met leveranciersoverzicht
-        leveranciers_df = (
-            df.groupby(["Leverancier", "Leverancier ID"], dropna=False)
-            .size()
-            .reset_index(name="Aantal facturen")
-            .sort_values(by="Aantal facturen", ascending=False)
-        )
-
         output = BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            df.to_excel(writer, sheet_name="Alle facturen", index=False)
-            leveranciers_df.to_excel(writer, sheet_name="Leveranciers", index=False)
-
+        df.to_excel(output, index=False)
         output.seek(0)
 
         return send_file(
             output,
-            download_name="exact_invoices_all.xlsx",
-            as_attachment=True,
-            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            download_name="mission_freight.xlsx",
+            as_attachment=True
         )
 
     except Exception as e:
-        return f"Fout in sync: {str(e)}", 500
+        return f"Fout: {str(e)}"
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run()
