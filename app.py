@@ -5,7 +5,7 @@ import os
 from io import BytesIO
 
 app = Flask(__name__)
-app.secret_key = "supersecret"
+app.secret_key = os.environ.get("SECRET_KEY", "supersecret")
 
 # ENV VARS
 CLIENT_ID = os.environ.get("EXACT_CLIENT_ID")
@@ -27,6 +27,9 @@ def login():
 def callback():
     code = request.args.get("code")
 
+    if not code:
+        return "Geen code ontvangen van Exact.", 400
+
     data = {
         "grant_type": "authorization_code",
         "client_id": CLIENT_ID,
@@ -38,7 +41,11 @@ def callback():
     response = requests.post(TOKEN_URL, data=data)
     token = response.json()
 
-    session["access_token"] = token.get("access_token")
+    access_token = token.get("access_token")
+    if not access_token:
+        return f"Geen access token ontvangen: {token}", 400
+
+    session["access_token"] = access_token
 
     return redirect("/sync")
 
@@ -56,7 +63,8 @@ def sync():
 
     url = f"{BASE_URL}/{division}/purchaseentry/PurchaseEntries?$filter=Supplier eq 'Mission Freight B.V.'"
 
-    res = requests.get(url, headers=headers).json()
+    response = requests.get(url, headers=headers)
+    res = response.json()
 
     results = []
 
@@ -65,7 +73,7 @@ def sync():
         factuur = item.get("InvoiceNumber", "")
         datum = item.get("EntryDate", "")
 
-        # Simpele berekening placeholder
+        # Placeholder
         kg = 1
         prijs_per_kg = totaal / kg if kg else 0
 
@@ -86,9 +94,14 @@ def sync():
     return send_file(
         output,
         download_name="exact_invoices.xlsx",
-        as_attachment=True
+        as_attachment=True,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
 @app.route("/")
 def home():
     return '<a href="/login">Login met Exact & download facturen</a>'
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
