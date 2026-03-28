@@ -103,7 +103,7 @@ def sync():
         "Accept": "application/json",
     }
 
-    # Probeer current division op te halen
+    # 👉 juiste division ophalen
     me_res = requests.get(f"{BASE_URL}/current/Me", headers=headers, timeout=30)
 
     if me_res.status_code != 200:
@@ -111,14 +111,14 @@ def sync():
 
     division = None
 
-    # Eerst JSON proberen
+    # eerst JSON proberen
     try:
         me_data = me_res.json()
         division = str(me_data["d"]["results"][0]["CurrentDivision"])
     except Exception:
         pass
 
-    # Fallback: XML/text parsen
+    # fallback XML parsing
     if not division:
         text = me_res.text
         match = re.search(r"<d:CurrentDivision>(\d+)</d:CurrentDivision>", text)
@@ -126,9 +126,15 @@ def sync():
             division = match.group(1)
 
     if not division:
-        return f"Division niet gevonden in response: {me_res.text}", 400
+        return f"Division niet gevonden: {me_res.text}", 400
 
-    url = f"{BASE_URL}/{division}/purchaseentry/PurchaseEntries?$top=100"
+    # 👉 FIX: $select toegevoegd (belangrijk!)
+    url = (
+        f"{BASE_URL}/{division}/purchaseentry/PurchaseEntries"
+        f"?$select=InvoiceNumber,EntryDate,AmountDC,SupplierName"
+        f"&$top=100"
+    )
+
     response = requests.get(url, headers=headers, timeout=30)
 
     if response.status_code != 200:
@@ -142,10 +148,10 @@ def sync():
     results = []
 
     for item in res.get("d", {}).get("results", []):
-        leverancier = item.get("SupplierName", "") or str(item.get("Supplier", ""))
-        totaal = item.get("AmountDC", 0) or 0
-        factuur = item.get("InvoiceNumber", "") or ""
-        datum = item.get("EntryDate", "") or ""
+        leverancier = item.get("SupplierName", "")
+        totaal = item.get("AmountDC", 0)
+        factuur = item.get("InvoiceNumber", "")
+        datum = item.get("EntryDate", "")
 
         try:
             prijs_per_kg = float(totaal)
