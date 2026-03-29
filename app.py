@@ -5,10 +5,20 @@ import os
 import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 import pandas as pd
-from flask import Flask, Response, redirect, render_template_string, request, send_file, session, url_for
+import requests
+from flask import (
+    Flask,
+    Response,
+    redirect,
+    render_template_string,
+    request,
+    send_file,
+    session,
+    url_for,
+)
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
@@ -19,19 +29,31 @@ except Exception:
 
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "mission-freight-pdf-tool")
+app.secret_key = os.environ.get("SECRET_KEY", "exact-pdf-clean-base")
 
+CLIENT_ID = os.environ.get("EXACT_CLIENT_ID")
+CLIENT_SECRET = os.environ.get("EXACT_CLIENT_SECRET")
+REDIRECT_URI = os.environ.get("EXACT_REDIRECT_URI")
+EXACT_DIVISION = os.environ.get("EXACT_DIVISION", "").strip()  # zet hier 110 in Render als je wilt
+
+AUTH_URL = "https://start.exactonline.nl/api/oauth2/auth"
+TOKEN_URL = "https://start.exactonline.nl/api/oauth2/token"
+BASE_URL = "https://start.exactonline.nl/api/v1"
+
+TARGET_SUPPLIER = "mission freight"
 
 CHARGE_KEYWORDS = [
+    "warehouse import charges",
     "import warehouse charges",
-    "handling",
+    "warehouse charges",
     "handling charges",
     "handling fee",
+    "handling",
 ]
 
 
 @dataclass
-class InvoiceResult:
+class PdfInvoiceResult:
     bestandsnaam: str
     factuurnummer: Optional[str]
     awb_nummer: Optional[str]
@@ -41,14 +63,46 @@ class InvoiceResult:
     status: str
 
 
+def normalize_supplier(text: str) -> str:
+    return (text or "").strip().lower()
+
+
 def normalize_spaces(text: str) -> str:
     text = text.replace("\xa0", " ").replace("\u200b", " ")
-    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"[ \t\r\n]+", " ", text)
+    return text.strip()
+
+
+def safe_json(response) -> Optional[dict]:
+    text = response.text or ""
+    if not text.strip():
+        return None
+    try:
+        return response.json()
+    except Exception:
+        return None
+
+
+def exact_date_to_text(value: Any) -> str:
+    if not value:
+        return ""
+    text = str(value)
+    match = re.search(r"/Date\((\d+)", text)
+    if match:
+        try:
+            return pd.to_datetime(int(match.group(1)), unit="ms").strftime("%Y-%m-%d")
+        except Exception:
+            return text
     return text
 
 
 def parse_decimal_eu(value: str) -> Optional[Decimal]:
-    cleaned = value.strip().replace("EUR", "").replace("€", "").replace(" ", "")
+    cleaned = (
+        value.strip()
+        .replace("EUR", "")
+        .replace("€", "")
+        .replace(" ", "")
+    )
     if not cleaned:
         return None
 
@@ -66,21 +120,108 @@ def parse_decimal_eu(value: str) -> Optional[Decimal]:
         return None
 
 
+def get_division(headers: dict) -> str:
+    if EXACT_DIVISION:
+        return EXACT_DIVISION
+
+    res = requests.get(f"{BASE_URL}/current/Me", headers=headers, timeout=30)
+    if res.status_code != 200:
+        raise RuntimeError(f"Division ophalen mislukt: HTTP {res.status_code} - {res.text[:500]}")
+
+    data = safe_json(res)
+    if data:
+        try:
+            return str(data["d"]["results"][0]["CurrentDivision"])
+        except Exception:
+            pass
+
+    text = res.text or ""
+    match = re.search(r"<d:CurrentDivision>(\d+)</d:CurrentDivision>", text)
+    if match:
+        return match.group(1)
+
+    raise RuntimeError(f"Division niet gevonden. Response: {text[:500]}")
+
+
+def get_all_purchase_entries(headers: dict, division: str) -> List[Dict[str, Any]]:
+    url = (
+        f"{BASE_URL}/{division}/purchaseentry/PurchaseEntries"
+        "?$select=InvoiceNumber,SupplierName,AmountDC,EntryDate,Description,EntryID,EntryNumber,Currency,Status"
+        "&$top=100"
+        "&$orderby=EntryDate desc"
+    )
+
+    all_results: List[Dict[str, Any]] = []
+
+    while url:
+        res = requests.get(url, headers=headers, timeout=60)
+
+        if res.status_code != 200:
+            raise RuntimeError(f"Exact fout: HTTP {res.status_code} - {res.text[:500]}")
+
+        data = safe_json(res)
+        if not data:
+            raise RuntimeError(f"Lege of onleesbare response van Exact: {res.text[:500]}")
+
+        d = data.get("d", {})
+        results = d.get("results", []) if isinstance(d, dict) else []
+        all_results.extend(results)
+
+        url = d.get("__next") if isinstance(d, dict) else None
+
+    return all_results
+
+
+def fetch_exact_mission_freight_rows(token: str) -> List[Dict[str, Any]]:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+
+    division = get_division(headers)
+    entries = get_all_purchase_entries(headers, division)
+
+    filtered = [
+        item for item in entries
+        if TARGET_SUPPLIER in normalize_supplier(item.get("SupplierName") or "")
+    ]
+
+    results: List[Dict[str, Any]] = []
+
+    for item in filtered:
+        results.append(
+            {
+                "Bron": "PurchaseEntries",
+                "Factuurnummer": str(item.get("InvoiceNumber") or ""),
+                "Factuurdatum": exact_date_to_text(item.get("EntryDate", "")),
+                "Leverancier": item.get("SupplierName", ""),
+                "Exact omschrijving": item.get("Description", ""),
+                "Exact totaal DC": item.get("AmountDC", 0),
+                "Valuta": item.get("Currency", ""),
+                "Exact document id": item.get("EntryID", ""),
+                "Exact boekingsnummer": item.get("EntryNumber", ""),
+                "Exact status": item.get("Status", ""),
+            }
+        )
+
+    return results
+
+
 def extract_text_from_pdf_bytes(data: bytes) -> str:
     if fitz is None:
-        raise RuntimeError("PyMuPDF is niet beschikbaar. Voeg pymupdf toe aan requirements.txt.")
+        raise RuntimeError("PyMuPDF ontbreekt. Voeg pymupdf toe aan requirements.txt.")
     with fitz.open(stream=data, filetype="pdf") as doc:
         return "\n".join(page.get_text("text") for page in doc)
 
 
 def extract_words_from_pdf_bytes(data: bytes):
     if fitz is None:
-        raise RuntimeError("PyMuPDF is niet beschikbaar. Voeg pymupdf toe aan requirements.txt.")
+        raise RuntimeError("PyMuPDF ontbreekt. Voeg pymupdf toe aan requirements.txt.")
     words = []
     with fitz.open(stream=data, filetype="pdf") as doc:
         for page_index, page in enumerate(doc):
-            for w in page.get_text("words"):
-                words.append((page_index, *w))
+            for word in page.get_text("words"):
+                words.append((page_index, *word))
     return words
 
 
@@ -137,10 +278,8 @@ def find_total_weight_kg_from_words(words) -> Optional[Decimal]:
             continue
 
         center_x = (x0 + x1) / 2
-
         if y0 <= by1:
             continue
-
         if abs(center_x - bruto_center_x) > 100:
             continue
 
@@ -157,29 +296,48 @@ def find_total_weight_kg_from_words(words) -> Optional[Decimal]:
     return None
 
 
+def find_charge_amount(text: str, keyword_patterns: List[str]) -> Optional[Decimal]:
+    normalized = normalize_spaces(text).lower()
+    amount_pattern = r"([0-9]{1,3}(?:[.\s][0-9]{3})*(?:[.,][0-9]{2})|[0-9]+(?:[.,][0-9]{2}))"
+
+    for keyword_pattern in keyword_patterns:
+        regex = rf"{keyword_pattern}[\s:;-]{{0,15}}(?:eur[\s]*)?{amount_pattern}"
+        match = re.search(regex, normalized, re.IGNORECASE)
+        if match:
+            value = parse_decimal_eu(match.group(1))
+            if value is not None:
+                return value
+
+    return None
+
+
 def sum_relevant_charges(text: str) -> Optional[Decimal]:
-    total = Decimal("0")
-    found = False
+    warehouse = find_charge_amount(
+        text,
+        [
+            r"warehouse\s+import\s+charges",
+            r"import\s+warehouse\s+charges",
+            r"warehouse\s+charges",
+        ],
+    )
+    if warehouse is not None:
+        return warehouse
 
-    lines = [normalize_spaces(line).strip().lower() for line in text.splitlines() if line.strip()]
+    handling = find_charge_amount(
+        text,
+        [
+            r"handling\s+charges",
+            r"handling\s+fee",
+            r"handling",
+        ],
+    )
+    if handling is not None:
+        return handling
 
-    for line in lines:
-        if not any(keyword in line for keyword in CHARGE_KEYWORDS):
-            continue
-
-        amounts = re.findall(r"([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2}))", line)
-        if not amounts:
-            continue
-
-        amount = parse_decimal_eu(amounts[-1])
-        if amount is not None:
-            total += amount
-            found = True
-
-    return total if found else None
+    return None
 
 
-def parse_invoice(file_name: str, data: bytes) -> InvoiceResult:
+def parse_pdf_invoice(file_name: str, data: bytes) -> PdfInvoiceResult:
     try:
         text = extract_text_from_pdf_bytes(data)
         words = extract_words_from_pdf_bytes(data)
@@ -201,11 +359,11 @@ def parse_invoice(file_name: str, data: bytes) -> InvoiceResult:
         if totaal_kg is None:
             missing.append("totaal kg")
         if charges is None:
-            missing.append("Import warehouse charges / Handling")
+            missing.append("Import/warehouse charges of handling")
 
         status = "OK" if not missing else f"Ontbreekt: {', '.join(missing)}"
 
-        return InvoiceResult(
+        return PdfInvoiceResult(
             bestandsnaam=file_name,
             factuurnummer=factuurnummer,
             awb_nummer=awb_nummer,
@@ -214,9 +372,8 @@ def parse_invoice(file_name: str, data: bytes) -> InvoiceResult:
             prijs_per_kg_eur=float(prijs_per_kg) if prijs_per_kg is not None else None,
             status=status,
         )
-
     except Exception as exc:
-        return InvoiceResult(
+        return PdfInvoiceResult(
             bestandsnaam=file_name,
             factuurnummer=None,
             awb_nummer=None,
@@ -227,37 +384,76 @@ def parse_invoice(file_name: str, data: bytes) -> InvoiceResult:
         )
 
 
-def dataframe_from_results(results: List[InvoiceResult]) -> pd.DataFrame:
-    return pd.DataFrame(
-        [
+def merge_exact_and_pdf(exact_rows: List[Dict[str, Any]], pdf_results: List[PdfInvoiceResult]) -> pd.DataFrame:
+    pdf_map: Dict[str, PdfInvoiceResult] = {}
+    for pdf in pdf_results:
+        if pdf.factuurnummer:
+            pdf_map[str(pdf.factuurnummer)] = pdf
+
+    merged_rows: List[Dict[str, Any]] = []
+    used_pdf_numbers = set()
+
+    for row in exact_rows:
+        factuurnummer = str(row.get("Factuurnummer") or "")
+        pdf = pdf_map.get(factuurnummer)
+        if pdf:
+            used_pdf_numbers.add(factuurnummer)
+
+        merged_rows.append(
             {
-                "Factuurnummer": r.factuurnummer,
-                "AWB nummer": r.awb_nummer,
-                "Totaal kg": r.totaal_kg,
-                "Charges (EUR)": r.charges_eur,
-                "Prijs per kg (EUR)": r.prijs_per_kg_eur,
-                "Bestandsnaam": r.bestandsnaam,
-                "Status": r.status,
+                "Factuurnummer": factuurnummer,
+                "AWB nummer": pdf.awb_nummer if pdf else "",
+                "Factuurdatum": row.get("Factuurdatum", ""),
+                "Leverancier": row.get("Leverancier", ""),
+                "Totaal kg": pdf.totaal_kg if pdf else None,
+                "Charges (EUR)": pdf.charges_eur if pdf else None,
+                "Prijs per kg (EUR)": pdf.prijs_per_kg_eur if pdf else None,
+                "PDF bestandsnaam": pdf.bestandsnaam if pdf else "",
+                "PDF status": pdf.status if pdf else "Geen PDF gekoppeld",
+                "Bron": row.get("Bron", ""),
+                "Exact document id": row.get("Exact document id", ""),
+                "Exact boekingsnummer": row.get("Exact boekingsnummer", ""),
+                "Exact omschrijving": row.get("Exact omschrijving", ""),
+                "Exact totaal DC": row.get("Exact totaal DC", 0),
+                "Valuta": row.get("Valuta", ""),
+                "Exact status": row.get("Exact status", ""),
             }
-            for r in results
-        ]
-    )
+        )
+
+    for pdf in pdf_results:
+        if not pdf.factuurnummer or pdf.factuurnummer in used_pdf_numbers:
+            continue
+
+        merged_rows.append(
+            {
+                "Factuurnummer": pdf.factuurnummer,
+                "AWB nummer": pdf.awb_nummer,
+                "Factuurdatum": "",
+                "Leverancier": "Mission Freight (alleen PDF)",
+                "Totaal kg": pdf.totaal_kg,
+                "Charges (EUR)": pdf.charges_eur,
+                "Prijs per kg (EUR)": pdf.prijs_per_kg_eur,
+                "PDF bestandsnaam": pdf.bestandsnaam,
+                "PDF status": pdf.status,
+                "Bron": "PDF only",
+                "Exact document id": "",
+                "Exact boekingsnummer": "",
+                "Exact omschrijving": "",
+                "Exact totaal DC": "",
+                "Valuta": "",
+                "Exact status": "",
+            }
+        )
+
+    return pd.DataFrame(merged_rows)
 
 
 def build_excel_bytes(df: pd.DataFrame) -> bytes:
     wb = Workbook()
     ws = wb.active
-    ws.title = "Resultaten"
+    ws.title = "Samengevoegd"
 
-    headers = [
-        "Factuurnummer",
-        "AWB nummer",
-        "Totaal kg",
-        "Charges (EUR)",
-        "Prijs per kg (EUR)",
-        "Bestandsnaam",
-        "Status",
-    ]
+    headers = list(df.columns)
     ws.append(headers)
 
     fill = PatternFill(fill_type="solid", fgColor="1F4E78")
@@ -270,29 +466,13 @@ def build_excel_bytes(df: pd.DataFrame) -> bytes:
         cell.alignment = Alignment(horizontal="center")
 
     for _, row in df.iterrows():
-        ws.append(
-            [
-                row.get("Factuurnummer"),
-                row.get("AWB nummer"),
-                row.get("Totaal kg"),
-                row.get("Charges (EUR)"),
-                row.get("Prijs per kg (EUR)"),
-                row.get("Bestandsnaam"),
-                row.get("Status"),
-            ]
-        )
+        ws.append([row.get(col) for col in headers])
 
-    ws.column_dimensions["A"].width = 18
-    ws.column_dimensions["B"].width = 18
-    ws.column_dimensions["C"].width = 14
-    ws.column_dimensions["D"].width = 16
-    ws.column_dimensions["E"].width = 18
-    ws.column_dimensions["F"].width = 26
-    ws.column_dimensions["G"].width = 30
-
-    for row in ws.iter_rows(min_row=2, min_col=3, max_col=5):
-        for cell in row:
-            cell.number_format = "0.00000"
+    for col, width in {
+        "A": 16, "B": 18, "C": 14, "D": 22, "E": 12, "F": 14, "G": 16,
+        "H": 24, "I": 18, "J": 18, "K": 18, "L": 24, "M": 14, "N": 12, "O": 14
+    }.items():
+        ws.column_dimensions[col].width = width
 
     bio = io.BytesIO()
     wb.save(bio)
@@ -300,20 +480,10 @@ def build_excel_bytes(df: pd.DataFrame) -> bytes:
     return bio.read()
 
 
-def load_session_df() -> pd.DataFrame:
-    raw = session.get("results_json")
+def session_get_df(key: str) -> pd.DataFrame:
+    raw = session.get(key)
     if not raw:
-        return pd.DataFrame(
-            columns=[
-                "Factuurnummer",
-                "AWB nummer",
-                "Totaal kg",
-                "Charges (EUR)",
-                "Prijs per kg (EUR)",
-                "Bestandsnaam",
-                "Status",
-            ]
-        )
+        return pd.DataFrame()
     return pd.read_json(io.StringIO(raw))
 
 
@@ -322,208 +492,87 @@ HTML = """
 <html lang="nl">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Mission Freight PDF Tool</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Exact + PDF Mission Freight Tool</title>
   <style>
-    :root {
-      --bg: #f5f7fb;
-      --card: #ffffff;
-      --text: #14213d;
-      --muted: #5b6475;
-      --primary: #2563eb;
-      --border: #dbe2f0;
-      --ok: #117a37;
-      --warn: #b26a00;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-    }
-    .wrap {
-      max-width: 980px;
-      margin: 0 auto;
-      padding: 18px;
-    }
-    .card {
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 18px;
-      padding: 20px;
-      box-shadow: 0 8px 24px rgba(20, 33, 61, 0.06);
-      margin-bottom: 16px;
-    }
-    h1 {
-      font-size: 1.6rem;
-      margin: 0 0 10px;
-    }
-    h2 {
-      font-size: 1.2rem;
-      margin: 0 0 12px;
-    }
-    p {
-      margin: 0 0 10px;
-      color: var(--muted);
-      line-height: 1.5;
-    }
-    .dropzone {
-      border: 2px dashed var(--primary);
-      border-radius: 18px;
-      padding: 24px;
-      text-align: center;
-      background: #f8fbff;
-    }
-    .btn {
-      display: inline-block;
-      width: 100%;
-      border: 0;
-      border-radius: 14px;
-      padding: 14px 16px;
-      font-size: 16px;
-      font-weight: 600;
-      text-decoration: none;
-      text-align: center;
-      margin-top: 12px;
-      cursor: pointer;
-    }
-    .btn-primary {
-      background: var(--primary);
-      color: white;
-    }
-    .btn-secondary {
-      background: #eef3ff;
-      color: var(--primary);
-    }
-    input[type=file] {
-      width: 100%;
-      margin-top: 12px;
-      font-size: 16px;
-    }
-    .result-card {
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 14px;
-      margin-bottom: 12px;
-      background: #fcfdff;
-    }
-    .label {
-      font-size: 12px;
-      color: var(--muted);
-      margin-bottom: 4px;
-    }
-    .value {
-      font-size: 16px;
-      font-weight: 600;
-      margin-bottom: 10px;
-      word-break: break-word;
-    }
-    .status-ok {
-      color: var(--ok);
-      font-weight: 700;
-    }
-    .status-warn {
-      color: var(--warn);
-      font-weight: 700;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 14px;
-    }
-    th, td {
-      padding: 12px 10px;
-      border-bottom: 1px solid var(--border);
-      text-align: left;
-      vertical-align: top;
-    }
-    th {
-      color: var(--muted);
-      font-weight: 600;
-    }
-    .desktop-only { display: none; }
-    @media (min-width: 760px) {
-      .btn {
-        width: auto;
-        min-width: 220px;
-      }
-      .desktop-only { display: block; }
-      .mobile-only { display: none; }
-    }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; background: #f5f7fb; margin: 0; padding: 18px; color: #14213d; }
+    .wrap { max-width: 1000px; margin: 0 auto; }
+    .card { background: white; border: 1px solid #dbe2f0; border-radius: 18px; padding: 20px; margin-bottom: 16px; }
+    h1 { margin: 0 0 10px; font-size: 1.7rem; }
+    h2 { margin: 0 0 10px; font-size: 1.25rem; }
+    p { color: #5b6475; line-height: 1.5; }
+    .btn { display: inline-block; background: #2563eb; color: white; padding: 14px 18px; border-radius: 14px; text-decoration: none; font-weight: 700; border: 0; cursor: pointer; margin-top: 10px; }
+    .btn-secondary { background: #eef3ff; color: #2563eb; }
+    input[type=file] { width: 100%; margin-top: 12px; font-size: 16px; }
+    .ok { color: #117a37; font-weight: 700; }
+    .warn { color: #b26a00; font-weight: 700; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { padding: 10px; border-bottom: 1px solid #dbe2f0; text-align: left; vertical-align: top; }
+    th { color: #5b6475; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="card">
-      <h1>Mission Freight PDF Tool</h1>
-      <p>Upload één of meer Mission Freight PDF-facturen. De tool leest automatisch factuurnummer, AWB nummer, gewicht en relevante charges. Daarna berekent hij de prijs per kg en maakt een Excel.</p>
-    </div>
+      <h1>Exact + PDF Mission Freight Tool</h1>
+      <p>Stap 1: haal Mission Freight uit Exact.</p>
+      <p>Stap 2: upload Mission Freight PDF's.</p>
+      <p>Stap 3: download één Excel met samengevoegde resultaten.</p>
 
-    <div class="card">
-      <form method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data">
-        <div class="dropzone">
-          <strong>Upload je PDF-facturen</strong>
-          <p>Kies één of meerdere bestanden</p>
-          <input type="file" name="files" accept="application/pdf" multiple required>
-        </div>
-        <button class="btn btn-primary" type="submit">Verwerk PDF's</button>
-      </form>
-      {% if has_results %}
-      <a class="btn btn-secondary" href="{{ url_for('download_excel') }}">Download Excel</a>
+      {% if connected %}
+        <p class="ok">Exact is gekoppeld.</p>
+        <a class="btn" href="{{ url_for('fetch_exact') }}">1. Haal Mission Freight uit Exact</a>
+      {% else %}
+        <a class="btn" href="{{ url_for('login') }}">Login met Exact</a>
       {% endif %}
     </div>
 
-    {% if has_results %}
-    <div class="card mobile-only">
-      <h2>Resultaten</h2>
-      {% for row in rows %}
-      <div class="result-card">
-        <div class="label">Factuurnummer</div>
-        <div class="value">{{ row['Factuurnummer'] or '—' }}</div>
+    <div class="card">
+      <h2>2. Upload Mission Freight PDF's</h2>
+      <form method="post" action="{{ url_for('upload_pdfs') }}" enctype="multipart/form-data">
+        <input type="file" name="files" accept="application/pdf" multiple required>
+        <button class="btn" type="submit">Verwerk PDF's</button>
+      </form>
 
-        <div class="label">AWB nummer</div>
-        <div class="value">{{ row['AWB nummer'] or '—' }}</div>
-
-        <div class="label">Totaal kg</div>
-        <div class="value">{% if row['Totaal kg'] == row['Totaal kg'] and row['Totaal kg'] is not none %}{{ '%.3f'|format(row['Totaal kg']) }}{% else %}—{% endif %}</div>
-
-        <div class="label">Charges (EUR)</div>
-        <div class="value">{% if row['Charges (EUR)'] == row['Charges (EUR)'] and row['Charges (EUR)'] is not none %}{{ '%.2f'|format(row['Charges (EUR)']) }}{% else %}—{% endif %}</div>
-
-        <div class="label">Prijs per kg (EUR)</div>
-        <div class="value">{% if row['Prijs per kg (EUR)'] == row['Prijs per kg (EUR)'] and row['Prijs per kg (EUR)'] is not none %}{{ '%.5f'|format(row['Prijs per kg (EUR)']) }}{% else %}—{% endif %}</div>
-
-        <div class="label">Status</div>
-        <div class="value {% if row['Status'] == 'OK' %}status-ok{% else %}status-warn{% endif %}">{{ row['Status'] }}</div>
-      </div>
-      {% endfor %}
+      {% if can_download %}
+        <a class="btn btn-secondary" href="{{ url_for('download_excel') }}">3. Download Excel</a>
+      {% endif %}
     </div>
 
-    <div class="card desktop-only">
-      <h2>Resultaten</h2>
+    <div class="card">
+      <h2>Status</h2>
+      <p>Exact regels: <strong>{{ exact_count }}</strong></p>
+      <p>PDF regels: <strong>{{ pdf_count }}</strong></p>
+      <p>Samengevoegde regels: <strong>{{ merged_count }}</strong></p>
+    </div>
+
+    {% if merged_rows %}
+    <div class="card">
+      <h2>Voorbeeld resultaten</h2>
       <table>
         <thead>
           <tr>
             <th>Factuurnummer</th>
-            <th>AWB nummer</th>
-            <th>Totaal kg</th>
-            <th>Charges (EUR)</th>
-            <th>Prijs per kg (EUR)</th>
-            <th>Bestandsnaam</th>
-            <th>Status</th>
+            <th>AWB</th>
+            <th>Factuurdatum</th>
+            <th>Leverancier</th>
+            <th>KG</th>
+            <th>Charges</th>
+            <th>Prijs/kg</th>
+            <th>PDF status</th>
           </tr>
         </thead>
         <tbody>
-          {% for row in rows %}
+          {% for row in merged_rows[:20] %}
           <tr>
-            <td>{{ row['Factuurnummer'] or '—' }}</td>
-            <td>{{ row['AWB nummer'] or '—' }}</td>
-            <td>{% if row['Totaal kg'] == row['Totaal kg'] and row['Totaal kg'] is not none %}{{ '%.3f'|format(row['Totaal kg']) }}{% else %}—{% endif %}</td>
-            <td>{% if row['Charges (EUR)'] == row['Charges (EUR)'] and row['Charges (EUR)'] is not none %}{{ '%.2f'|format(row['Charges (EUR)']) }}{% else %}—{% endif %}</td>
-            <td>{% if row['Prijs per kg (EUR)'] == row['Prijs per kg (EUR)'] and row['Prijs per kg (EUR)'] is not none %}{{ '%.5f'|format(row['Prijs per kg (EUR)']) }}{% else %}—{% endif %}</td>
-            <td>{{ row['Bestandsnaam'] or '—' }}</td>
-            <td class="{% if row['Status'] == 'OK' %}status-ok{% else %}status-warn{% endif %}">{{ row['Status'] }}</td>
+            <td>{{ row.get('Factuurnummer', '') }}</td>
+            <td>{{ row.get('AWB nummer', '') }}</td>
+            <td>{{ row.get('Factuurdatum', '') }}</td>
+            <td>{{ row.get('Leverancier', '') }}</td>
+            <td>{{ row.get('Totaal kg', '') }}</td>
+            <td>{{ row.get('Charges (EUR)', '') }}</td>
+            <td>{{ row.get('Prijs per kg (EUR)', '') }}</td>
+            <td class="{% if row.get('PDF status','') == 'OK' %}ok{% else %}warn{% endif %}">{{ row.get('PDF status', '') }}</td>
           </tr>
           {% endfor %}
         </tbody>
@@ -536,39 +585,162 @@ HTML = """
 """
 
 
-@app.get("/")
+@app.route("/")
 def index():
-    df = load_session_df()
-    rows = df.to_dict(orient="records") if not df.empty else []
-    return render_template_string(HTML, rows=rows, has_results=bool(rows))
+    exact_df = session_get_df("exact_json")
+    pdf_df = session_get_df("pdf_json")
+    merged_df = session_get_df("merged_json")
+
+    rows = merged_df.to_dict(orient="records") if not merged_df.empty else []
+
+    return render_template_string(
+        HTML,
+        connected=bool(session.get("access_token")),
+        exact_count=len(exact_df),
+        pdf_count=len(pdf_df),
+        merged_count=len(merged_df),
+        can_download=not merged_df.empty,
+        merged_rows=rows,
+    )
 
 
-@app.post("/upload")
-def upload():
+@app.route("/login")
+def login():
+    if not CLIENT_ID or not CLIENT_SECRET or not REDIRECT_URI:
+        return (
+            "Environment variables ontbreken. Zet EXACT_CLIENT_ID, "
+            "EXACT_CLIENT_SECRET en EXACT_REDIRECT_URI in Render.",
+            500,
+        )
+
+    url = (
+        f"{AUTH_URL}"
+        f"?client_id={CLIENT_ID}"
+        f"&redirect_uri={REDIRECT_URI}"
+        f"&response_type=code"
+        f"&scope=exactonlineapi%20offline_access"
+    )
+    return redirect(url)
+
+
+@app.route("/callback")
+def callback():
+    error = request.args.get("error")
+    code = request.args.get("code")
+
+    if error:
+        return f"Exact fout: {error}", 400
+
+    if not code:
+        return "Geen code ontvangen van Exact.", 400
+
+    data = {
+        "grant_type": "authorization_code",
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "code": code,
+        "redirect_uri": REDIRECT_URI,
+    }
+
+    res = requests.post(TOKEN_URL, data=data, timeout=30)
+    token = safe_json(res)
+
+    if not token:
+        return f"Token response niet leesbaar: {res.text}", 400
+
+    access_token = token.get("access_token")
+    if not access_token:
+        return f"Geen access token ontvangen: {token}", 400
+
+    session["access_token"] = access_token
+    session["refresh_token"] = token.get("refresh_token")
+
+    return redirect(url_for("index"))
+
+
+@app.route("/fetch_exact")
+def fetch_exact():
+    try:
+        token = session.get("access_token")
+        if not token:
+            return redirect(url_for("login"))
+
+        exact_rows = fetch_exact_mission_freight_rows(token)
+        exact_df = pd.DataFrame(exact_rows)
+        session["exact_json"] = exact_df.to_json(orient="records")
+
+        pdf_df = session_get_df("pdf_json")
+        pdf_results = []
+        if not pdf_df.empty:
+            for _, row in pdf_df.iterrows():
+                pdf_results.append(
+                    PdfInvoiceResult(
+                        bestandsnaam=row.get("PDF bestandsnaam") or row.get("Bestandsnaam"),
+                        factuurnummer=row.get("Factuurnummer"),
+                        awb_nummer=row.get("AWB nummer"),
+                        totaal_kg=row.get("Totaal kg"),
+                        charges_eur=row.get("Charges (EUR)"),
+                        prijs_per_kg_eur=row.get("Prijs per kg (EUR)"),
+                        status=row.get("PDF status") or row.get("Status"),
+                    )
+                )
+
+        merged_df = merge_exact_and_pdf(exact_rows, pdf_results)
+        session["merged_json"] = merged_df.to_json(orient="records")
+
+        return redirect(url_for("index"))
+    except Exception as e:
+        return f"Fout bij ophalen Exact data: {str(e)}", 500
+
+
+@app.route("/upload-pdfs", methods=["POST"])
+def upload_pdfs():
     uploaded_files = request.files.getlist("files")
-    results: List[InvoiceResult] = []
+    pdf_results: List[PdfInvoiceResult] = []
 
     for file in uploaded_files:
         if not file.filename.lower().endswith(".pdf"):
             continue
-        results.append(parse_invoice(file.filename, file.read()))
+        pdf_results.append(parse_pdf_invoice(file.filename, file.read()))
 
-    df = dataframe_from_results(results)
-    session["results_json"] = df.to_json(orient="records")
+    exact_df = session_get_df("exact_json")
+    exact_rows = exact_df.to_dict(orient="records") if not exact_df.empty else []
+
+    merged_df = merge_exact_and_pdf(exact_rows, pdf_results)
+
+    pdf_df = pd.DataFrame(
+        [
+            {
+                "Factuurnummer": item.factuurnummer,
+                "AWB nummer": item.awb_nummer,
+                "Totaal kg": item.totaal_kg,
+                "Charges (EUR)": item.charges_eur,
+                "Prijs per kg (EUR)": item.prijs_per_kg_eur,
+                "Bestandsnaam": item.bestandsnaam,
+                "Status": item.status,
+            }
+            for item in pdf_results
+        ]
+    )
+
+    session["pdf_json"] = pdf_df.to_json(orient="records")
+    session["merged_json"] = merged_df.to_json(orient="records")
+
     return redirect(url_for("index"))
 
 
-@app.get("/download-excel")
+@app.route("/download-excel")
 def download_excel():
-    df = load_session_df()
-    if df.empty:
+    merged_df = session_get_df("merged_json")
+    if merged_df.empty:
         return "Nog geen data om te downloaden.", 400
 
-    excel_bytes = build_excel_bytes(df)
+    excel_bytes = build_excel_bytes(merged_df)
+
     return send_file(
         io.BytesIO(excel_bytes),
         as_attachment=True,
-        download_name="mission_freight_resultaten.xlsx",
+        download_name="mission_freight_exact_pdf.xlsx",
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
