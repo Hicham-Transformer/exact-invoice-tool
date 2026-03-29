@@ -2,12 +2,11 @@ from flask import Flask, redirect, request, session, send_file
 import os
 import re
 from io import BytesIO
-
 import pandas as pd
 import requests
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "supersecret")
+app.secret_key = "supersecret"
 
 CLIENT_ID = os.environ.get("EXACT_CLIENT_ID")
 CLIENT_SECRET = os.environ.get("EXACT_CLIENT_SECRET")
@@ -17,85 +16,63 @@ AUTH_URL = "https://start.exactonline.nl/api/oauth2/auth"
 TOKEN_URL = "https://start.exactonline.nl/api/oauth2/token"
 BASE_URL = "https://start.exactonline.nl/api/v1"
 
-TARGET_SUPPLIER = "mission freight"
+TARGET = "mission freight"
 
 
-def normalize(text):
-    return (text or "").strip().lower()
+def normalize(x):
+    return (x or "").lower().strip()
 
 
-def is_mission_freight(name):
-    return TARGET_SUPPLIER in normalize(name)
+def is_target(name):
+    return TARGET in normalize(name)
 
 
-def exact_date_to_text(value):
-    if not value:
+def date_fix(v):
+    if not v:
         return ""
-    m = re.search(r"/Date\((\d+)", str(value))
+    m = re.search(r"/Date\((\d+)", str(v))
     if m:
         return pd.to_datetime(int(m.group(1)), unit="ms").strftime("%Y-%m-%d")
-    return str(value)
+    return str(v)
 
 
-def parse_exact(data):
-    if isinstance(data, dict):
-        d = data.get("d")
-        if isinstance(d, dict):
-            return d.get("results", [])
-        if isinstance(d, list):
-            return d
-    return []
+def get_division(headers):
+    res = requests.get(f"{BASE_URL}/current/Me", headers=headers)
+    data = res.json()
+    return str(data["d"]["results"][0]["CurrentDivision"])
 
 
 def fetch_all(url, headers):
-    results = []
+    all_rows = []
     skip = 0
 
     while True:
-        full_url = f"{url}&$top=50&$skip={skip}"
-        res = requests.get(full_url, headers=headers, timeout=60)
+        full = f"{url}&$top=50&$skip={skip}"
+        res = requests.get(full, headers=headers)
 
         if res.status_code != 200:
-            print("ERROR:", res.text[:300])
+            print(res.text)
             break
 
-        try:
-            data = res.json()
-        except Exception:
-            print("JSON FAIL:", res.text[:300])
-            break
-
-        rows = parse_exact(data)
+        data = res.json()
+        rows = data.get("d", {}).get("results", [])
 
         if not rows:
             break
 
-        results.extend(rows)
+        all_rows.extend(rows)
 
         if len(rows) < 50:
             break
 
         skip += 50
 
-    return results
-
-
-def get_division(headers):
-    res = requests.get(f"{BASE_URL}/current/Me", headers=headers)
-
-    try:
-        data = res.json()
-        return str(data["d"]["results"][0]["CurrentDivision"])
-    except Exception:
-        raise Exception("Division ophalen mislukt")
+    return all_rows
 
 
 @app.route("/")
 def home():
-    return """
-    <h2>Exact Invoice Tool</h2>
-    <a href="/login">Login met Exact</a>
-    """
+    return '<a href="/login">Start</a>'
 
 
 @app.route("/login")
@@ -123,7 +100,6 @@ def callback():
     }
 
     res = requests.post(TOKEN_URL, data=data)
-
     token = res.json()
 
     session["access_token"] = token["access_token"]
@@ -139,10 +115,7 @@ def sync():
 
         division = get_division(headers)
 
-        url = (
-            f"{BASE_URL}/{division}/purchaseentry/PurchaseEntries?"
-            f"$select=InvoiceNumber,EntryDate,AmountDC,SupplierName,Description"
-        )
+        url = f"{BASE_URL}/{division}/purchaseentry/PurchaseEntries?"
 
         rows = fetch_all(url, headers)
 
@@ -151,20 +124,22 @@ def sync():
         for r in rows:
             leverancier = r.get("SupplierName", "")
 
-            if not is_mission_freight(leverancier):
+            if not is_target(leverancier):
                 continue
 
             results.append({
                 "Factuurnummer": r.get("InvoiceNumber"),
-                "Datum": exact_date_to_text(r.get("EntryDate")),
+                "Datum": date_fix(r.get("EntryDate")),
                 "Leverancier": leverancier,
                 "Omschrijving": r.get("Description"),
-                "Totaal": r.get("AmountDC")
+                "Totaal": r.get("AmountDC"),
+                "Status": r.get("Status"),
+                "Valuta": r.get("Currency"),
+                "EntryID": r.get("EntryID"),
             })
 
-        # 🔥 fallback zodat je nooit leeg blijft
         if not results:
-            return "⚠️ Geen Mission Freight facturen gevonden — check naam in Exact"
+            return "⚠️ Geen Mission Freight boekingen gevonden (controleer Exact omgeving)"
 
         df = pd.DataFrame(results)
 
@@ -174,7 +149,7 @@ def sync():
 
         return send_file(
             output,
-            download_name="mission_freight.xlsx",
+            download_name="mission_freight_exact.xlsx",
             as_attachment=True
         )
 
