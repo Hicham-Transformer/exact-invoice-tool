@@ -39,6 +39,9 @@ AUTH_URL = "https://start.exactonline.nl/api/oauth2/auth"
 TOKEN_URL = "https://start.exactonline.nl/api/oauth2/token"
 BASE_URL = "https://start.exactonline.nl/api/v1"
 
+# VASTE EXACT ADMINISTRATIE
+DIVISION = "110"
+
 TARGET_SUPPLIER = "mission freight"
 
 CHARGE_KEYWORDS = [
@@ -87,30 +90,9 @@ def exact_date_to_text(value: Any) -> str:
     return text
 
 
-def get_current_division(headers: dict) -> str:
-    res = requests.get(f"{BASE_URL}/current/Me?$select=CurrentDivision", headers=headers, timeout=30)
-
-    if res.status_code != 200:
-        raise RuntimeError(f"Fout bij ophalen division: {res.text}")
-
-    data = safe_json(res)
-    if data:
-        try:
-            return str(data["d"]["results"][0]["CurrentDivision"])
-        except Exception:
-            pass
-
-    text = res.text or ""
-    match = re.search(r"<d:CurrentDivision>(\d+)</d:CurrentDivision>", text)
-    if match:
-        return match.group(1)
-
-    raise RuntimeError(f"Division niet gevonden: {text[:300]}")
-
-
-def get_all_purchase_entries(headers: dict, division: str) -> List[Dict[str, Any]]:
+def get_all_purchase_entries(headers: dict) -> List[Dict[str, Any]]:
     url = (
-        f"{BASE_URL}/{division}/purchaseentry/PurchaseEntries"
+        f"{BASE_URL}/{DIVISION}/purchaseentry/PurchaseEntries"
         f"?$select=EntryID,InvoiceNumber,EntryNumber,EntryDate,AmountDC,AmountFC,"
         f"Currency,Supplier,SupplierName,Description,YourRef,OrderNumber,DueDate,"
         f"Journal,PaymentCondition,Created,Modified,Status"
@@ -329,8 +311,7 @@ def fetch_exact_mission_freight_rows(token: str) -> List[Dict[str, Any]]:
         "Accept": "application/json",
     }
 
-    division = get_current_division(headers)
-    entries = get_all_purchase_entries(headers, division)
+    entries = get_all_purchase_entries(headers)
 
     filtered = [
         e for e in entries
@@ -502,6 +483,7 @@ HTML = """
   <div class="wrap">
     <div class="card">
       <h1>Exact + PDF Mission Freight Tool</h1>
+      <p>Vaste administratie: <strong>110</strong></p>
       <p>Stap 1: haal Mission Freight facturen uit Exact.</p>
       <p>Stap 2: upload dezelfde Mission Freight PDF-facturen.</p>
       <p>Stap 3: download één Excel met Exact + PDF gecombineerd.</p>
