@@ -117,8 +117,16 @@ def fetch_all(url, headers):
 @app.route("/")
 def home():
     return """
-    <h2>Exact Invoice Tool</h2>
-    <a href="/login">Login met Exact</a>
+    <html>
+      <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Exact Invoice Tool</title>
+      </head>
+      <body style="font-family: Arial, sans-serif; padding: 24px;">
+        <h2>Exact Invoice Tool</h2>
+        <p><a href="/login">Login met Exact</a></p>
+      </body>
+    </html>
     """
 
 
@@ -191,7 +199,7 @@ def sync():
 
         url = (
             f"{BASE_URL}/{division}/purchaseentry/PurchaseEntries"
-            f"?$select=InvoiceNumber,EntryDate,AmountDC,SupplierName,Description,Currency,EntryID,Status"
+            f"?$expand=PurchaseEntryLines"
         )
 
         rows = fetch_all(url, headers)
@@ -199,21 +207,52 @@ def sync():
         results = []
 
         for r in rows:
-            leverancier = r.get("SupplierName", "")
+            leverancier = (
+                r.get("SupplierName")
+                or r.get("Supplier")
+                or (
+                    r.get("PurchaseEntryLines", [{}])[0].get("SupplierName", "")
+                    if isinstance(r.get("PurchaseEntryLines"), list) and r.get("PurchaseEntryLines")
+                    else ""
+                )
+            )
 
-            if not is_target(leverancier):
+            if not is_target(str(leverancier)):
                 continue
 
-            results.append({
-                "Factuurnummer": r.get("InvoiceNumber", ""),
-                "Datum": date_fix(r.get("EntryDate")),
-                "Leverancier": leverancier,
-                "Omschrijving": r.get("Description", ""),
-                "Totaal": r.get("AmountDC", 0),
-                "Valuta": r.get("Currency", ""),
-                "Status": r.get("Status", ""),
-                "EntryID": r.get("EntryID", ""),
-            })
+            lines = r.get("PurchaseEntryLines", [])
+            if not isinstance(lines, list):
+                lines = []
+
+            if not lines:
+                results.append({
+                    "Factuurnummer": r.get("InvoiceNumber", ""),
+                    "Datum": date_fix(r.get("EntryDate")),
+                    "Leverancier": leverancier,
+                    "Omschrijving": r.get("Description", ""),
+                    "Totaal": r.get("AmountDC", 0),
+                    "Valuta": r.get("Currency", ""),
+                    "Status": r.get("Status", ""),
+                    "EntryID": r.get("EntryID", ""),
+                    "Regelomschrijving": "",
+                    "Aantal": "",
+                    "Regelbedrag": "",
+                })
+            else:
+                for line in lines:
+                    results.append({
+                        "Factuurnummer": r.get("InvoiceNumber", ""),
+                        "Datum": date_fix(r.get("EntryDate")),
+                        "Leverancier": leverancier,
+                        "Omschrijving": r.get("Description", ""),
+                        "Totaal": r.get("AmountDC", 0),
+                        "Valuta": r.get("Currency", ""),
+                        "Status": r.get("Status", ""),
+                        "EntryID": r.get("EntryID", ""),
+                        "Regelomschrijving": line.get("Description", ""),
+                        "Aantal": line.get("Quantity", ""),
+                        "Regelbedrag": line.get("AmountDC", ""),
+                    })
 
         if not results:
             return "⚠️ Geen Mission Freight boekingen gevonden"
