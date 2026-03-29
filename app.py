@@ -34,13 +34,11 @@ app.secret_key = os.environ.get("SECRET_KEY", "exact-pdf-clean-base")
 CLIENT_ID = os.environ.get("EXACT_CLIENT_ID")
 CLIENT_SECRET = os.environ.get("EXACT_CLIENT_SECRET")
 REDIRECT_URI = os.environ.get("EXACT_REDIRECT_URI")
-EXACT_DIVISION = os.environ.get("EXACT_DIVISION", "").strip()  # zet hier 110 in Render als je wilt
+EXACT_DIVISION = os.environ.get("EXACT_DIVISION", "").strip()
 
 AUTH_URL = "https://start.exactonline.nl/api/oauth2/auth"
 TOKEN_URL = "https://start.exactonline.nl/api/oauth2/token"
 BASE_URL = "https://start.exactonline.nl/api/v1"
-
-TARGET_SUPPLIER = "mission freight"
 
 CHARGE_KEYWORDS = [
     "warehouse import charges",
@@ -181,10 +179,35 @@ def fetch_exact_mission_freight_rows(token: str) -> List[Dict[str, Any]]:
     division = get_division(headers)
     entries = get_all_purchase_entries(headers, division)
 
-    filtered = [
-        item for item in entries
-        if TARGET_SUPPLIER in normalize_supplier(item.get("SupplierName") or "")
-    ]
+    supplier_names = sorted(
+        list(
+            {
+                (item.get("SupplierName") or "").strip()
+                for item in entries
+                if (item.get("SupplierName") or "").strip()
+            }
+        )
+    )
+
+    filtered = []
+    for item in entries:
+        supplier_name = (item.get("SupplierName") or "").strip().lower()
+        description = (item.get("Description") or "").strip().lower()
+
+        if (
+            "mission" in supplier_name
+            or "freight" in supplier_name
+            or "mission" in description
+            or "freight" in description
+        ):
+            filtered.append(item)
+
+    if not filtered:
+        raise RuntimeError(
+            "Geen Mission Freight match gevonden. "
+            f"Totaal entries: {len(entries)}. "
+            f"Eerste leveranciersnamen: {supplier_names[:20]}"
+        )
 
     results: List[Dict[str, Any]] = []
 
