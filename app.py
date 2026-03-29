@@ -39,9 +39,7 @@ AUTH_URL = "https://start.exactonline.nl/api/oauth2/auth"
 TOKEN_URL = "https://start.exactonline.nl/api/oauth2/token"
 BASE_URL = "https://start.exactonline.nl/api/v1"
 
-# VASTE EXACT ADMINISTRATIE
 DIVISION = "110"
-
 TARGET_SUPPLIER = "mission freight"
 
 CHARGE_KEYWORDS = [
@@ -81,10 +79,10 @@ def exact_date_to_text(value: Any) -> str:
     if not value:
         return ""
     text = str(value)
-    m = re.search(r"/Date\((\d+)", text)
-    if m:
+    match = re.search(r"/Date\((\d+)", text)
+    if match:
         try:
-            return pd.to_datetime(int(m.group(1)), unit="ms").strftime("%Y-%m-%d")
+            return pd.to_datetime(int(match.group(1)), unit="ms").strftime("%Y-%m-%d")
         except Exception:
             return text
     return text
@@ -93,31 +91,24 @@ def exact_date_to_text(value: Any) -> str:
 def get_all_purchase_entries(headers: dict) -> List[Dict[str, Any]]:
     url = (
         f"{BASE_URL}/{DIVISION}/purchaseentry/PurchaseEntries"
-        f"?$select=EntryID,InvoiceNumber,EntryNumber,EntryDate,AmountDC,AmountFC,"
-        f"Currency,Supplier,SupplierName,Description,YourRef,OrderNumber,DueDate,"
-        f"Journal,PaymentCondition,Created,Modified,Status"
-        f"&$top=100"
+        "?$select=InvoiceNumber,SupplierName,AmountDC,EntryDate,Description,EntryID,EntryNumber,Currency,Status"
+        "&$top=100"
+        "&$orderby=EntryDate desc"
     )
 
-    all_results: List[Dict[str, Any]] = []
+    res = requests.get(url, headers=headers, timeout=60)
 
-    while url:
-        res = requests.get(url, headers=headers, timeout=60)
+    if res.status_code != 200:
+        raise RuntimeError(f"Exact fout: {res.text}")
 
-        if res.status_code != 200:
-            raise RuntimeError(f"Exact fout: {res.text}")
+    data = safe_json(res)
+    if not data:
+        raise RuntimeError(f"Lege response van Exact: {res.text}")
 
-        data = safe_json(res)
-        if not data:
-            raise RuntimeError(f"Geen JSON van Exact ontvangen: {res.text[:300]}")
+    d = data.get("d", {})
+    results = d.get("results", []) if isinstance(d, dict) else []
 
-        d = data.get("d", {})
-        results = d.get("results", []) if isinstance(d, dict) else []
-        all_results.extend(results)
-
-        url = d.get("__next") if isinstance(d, dict) else None
-
-    return all_results
+    return results
 
 
 def normalize_spaces(text: str) -> str:
@@ -158,8 +149,8 @@ def extract_words_from_pdf_bytes(data: bytes):
     words = []
     with fitz.open(stream=data, filetype="pdf") as doc:
         for page_index, page in enumerate(doc):
-            for w in page.get_text("words"):
-                words.append((page_index, *w))
+            for word in page.get_text("words"):
+                words.append((page_index, *word))
     return words
 
 
@@ -216,10 +207,8 @@ def find_total_weight_kg_from_words(words) -> Optional[Decimal]:
             continue
 
         center_x = (x0 + x1) / 2
-
         if y0 <= by1:
             continue
-
         if abs(center_x - bruto_center_x) > 100:
             continue
 
@@ -314,8 +303,8 @@ def fetch_exact_mission_freight_rows(token: str) -> List[Dict[str, Any]]:
     entries = get_all_purchase_entries(headers)
 
     filtered = [
-        e for e in entries
-        if TARGET_SUPPLIER in normalize_supplier(e.get("SupplierName") or "")
+        item for item in entries
+        if TARGET_SUPPLIER in normalize_supplier(item.get("SupplierName") or "")
     ]
 
     results: List[Dict[str, Any]] = []
@@ -341,9 +330,9 @@ def fetch_exact_mission_freight_rows(token: str) -> List[Dict[str, Any]]:
 
 def merge_exact_and_pdf(exact_rows: List[Dict[str, Any]], pdf_results: List[PdfInvoiceResult]) -> pd.DataFrame:
     pdf_map: Dict[str, PdfInvoiceResult] = {}
-    for p in pdf_results:
-        if p.factuurnummer:
-            pdf_map[str(p.factuurnummer)] = p
+    for pdf in pdf_results:
+        if pdf.factuurnummer:
+            pdf_map[str(pdf.factuurnummer)] = pdf
 
     merged_rows: List[Dict[str, Any]] = []
     used_pdf_numbers = set()
@@ -375,21 +364,21 @@ def merge_exact_and_pdf(exact_rows: List[Dict[str, Any]], pdf_results: List[PdfI
             }
         )
 
-    for p in pdf_results:
-        if not p.factuurnummer or p.factuurnummer in used_pdf_numbers:
+    for pdf in pdf_results:
+        if not pdf.factuurnummer or pdf.factuurnummer in used_pdf_numbers:
             continue
 
         merged_rows.append(
             {
-                "Factuurnummer": p.factuurnummer,
-                "AWB nummer": p.awb_nummer,
+                "Factuurnummer": pdf.factuurnummer,
+                "AWB nummer": pdf.awb_nummer,
                 "Factuurdatum": "",
                 "Leverancier": "Mission Freight (alleen PDF)",
-                "Totaal kg": p.totaal_kg,
-                "Charges (EUR)": p.charges_eur,
-                "Prijs per kg (EUR)": p.prijs_per_kg_eur,
-                "PDF bestandsnaam": p.bestandsnaam,
-                "PDF status": p.status,
+                "Totaal kg": pdf.totaal_kg,
+                "Charges (EUR)": pdf.charges_eur,
+                "Prijs per kg (EUR)": pdf.prijs_per_kg_eur,
+                "PDF bestandsnaam": pdf.bestandsnaam,
+                "PDF status": pdf.status,
                 "Bron": "PDF only",
                 "Exact document id": "",
                 "Exact boekingsnummer": "",
@@ -641,16 +630,16 @@ def fetch_exact():
         pdf_df = session_get_df("pdf_json")
         pdf_results = []
         if not pdf_df.empty:
-            for _, r in pdf_df.iterrows():
+            for _, row in pdf_df.iterrows():
                 pdf_results.append(
                     PdfInvoiceResult(
-                        bestandsnaam=r.get("Bestandsnaam"),
-                        factuurnummer=r.get("Factuurnummer"),
-                        awb_nummer=r.get("AWB nummer"),
-                        totaal_kg=r.get("Totaal kg"),
-                        charges_eur=r.get("Charges (EUR)"),
-                        prijs_per_kg_eur=r.get("Prijs per kg (EUR)"),
-                        status=r.get("Status"),
+                        bestandsnaam=row.get("Bestandsnaam"),
+                        factuurnummer=row.get("Factuurnummer"),
+                        awb_nummer=row.get("AWB nummer"),
+                        totaal_kg=row.get("Totaal kg"),
+                        charges_eur=row.get("Charges (EUR)"),
+                        prijs_per_kg_eur=row.get("Prijs per kg (EUR)"),
+                        status=row.get("Status"),
                     )
                 )
 
@@ -675,15 +664,15 @@ def upload_pdfs():
     pdf_df = pd.DataFrame(
         [
             {
-                "Factuurnummer": r.factuurnummer,
-                "AWB nummer": r.awb_nummer,
-                "Totaal kg": r.totaal_kg,
-                "Charges (EUR)": r.charges_eur,
-                "Prijs per kg (EUR)": r.prijs_per_kg_eur,
-                "Bestandsnaam": r.bestandsnaam,
-                "Status": r.status,
+                "Factuurnummer": item.factuurnummer,
+                "AWB nummer": item.awb_nummer,
+                "Totaal kg": item.totaal_kg,
+                "Charges (EUR)": item.charges_eur,
+                "Prijs per kg (EUR)": item.prijs_per_kg_eur,
+                "Bestandsnaam": item.bestandsnaam,
+                "Status": item.status,
             }
-            for r in pdf_results
+            for item in pdf_results
         ]
     )
     session["pdf_json"] = pdf_df.to_json(orient="records")
