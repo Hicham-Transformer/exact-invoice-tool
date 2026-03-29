@@ -1,6 +1,6 @@
 flask
 requests
-python-dotenv
 pandas
 openpyxl
+pymupdf
 gunicorn
