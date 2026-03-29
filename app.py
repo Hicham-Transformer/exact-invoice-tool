@@ -34,7 +34,6 @@ app.secret_key = os.environ.get("SECRET_KEY", "exact-pdf-clean-base")
 CLIENT_ID = os.environ.get("EXACT_CLIENT_ID")
 CLIENT_SECRET = os.environ.get("EXACT_CLIENT_SECRET")
 REDIRECT_URI = os.environ.get("EXACT_REDIRECT_URI")
-EXACT_DIVISION = os.environ.get("EXACT_DIVISION", "").strip()
 
 AUTH_URL = "https://start.exactonline.nl/api/oauth2/auth"
 TOKEN_URL = "https://start.exactonline.nl/api/oauth2/token"
@@ -118,30 +117,41 @@ def parse_decimal_eu(value: str) -> Optional[Decimal]:
         return None
 
 
-def get_division(headers: dict) -> str:
-    if EXACT_DIVISION:
-        return EXACT_DIVISION
+def get_division(access_token: str) -> str:
+    url = f"{BASE_URL}/current/Me"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+    }
 
-    res = requests.get(f"{BASE_URL}/current/Me", headers=headers, timeout=30)
-    if res.status_code != 200:
-        raise RuntimeError(f"Division ophalen mislukt: HTTP {res.status_code} - {res.text[:500]}")
+    response = requests.get(url, headers=headers, timeout=30)
 
-    data = safe_json(res)
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Division ophalen mislukt: HTTP {response.status_code} - {response.text[:500]}"
+        )
+
+    data = safe_json(response)
     if data:
         try:
             return str(data["d"]["results"][0]["CurrentDivision"])
         except Exception:
             pass
 
-    text = res.text or ""
+    text = response.text or ""
     match = re.search(r"<d:CurrentDivision>(\d+)</d:CurrentDivision>", text)
     if match:
         return match.group(1)
 
-    raise RuntimeError(f"Division niet gevonden. Response: {text[:500]}")
+    raise RuntimeError(f"CurrentDivision niet gevonden in response: {text[:500]}")
 
 
-def get_all_purchase_entries(headers: dict, division: str) -> List[Dict[str, Any]]:
+def get_all_purchase_entries(access_token: str, division: str) -> List[Dict[str, Any]]:
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+    }
+
     url = (
         f"{BASE_URL}/{division}/purchaseentry/PurchaseEntries"
         "?$select=InvoiceNumber,SupplierName,AmountDC,EntryDate,Description,EntryID,EntryNumber,Currency,Status"
@@ -152,14 +162,16 @@ def get_all_purchase_entries(headers: dict, division: str) -> List[Dict[str, Any
     all_results: List[Dict[str, Any]] = []
 
     while url:
-        res = requests.get(url, headers=headers, timeout=60)
+        response = requests.get(url, headers=headers, timeout=60)
 
-        if res.status_code != 200:
-            raise RuntimeError(f"Exact fout: HTTP {res.status_code} - {res.text[:500]}")
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Exact fout: HTTP {response.status_code} - {response.text[:500]}"
+            )
 
-        data = safe_json(res)
+        data = safe_json(response)
         if not data:
-            raise RuntimeError(f"Lege of onleesbare response van Exact: {res.text[:500]}")
+            raise RuntimeError(f"Lege of onleesbare response van Exact: {response.text[:500]}")
 
         d = data.get("d", {})
         results = d.get("results", []) if isinstance(d, dict) else []
@@ -171,13 +183,8 @@ def get_all_purchase_entries(headers: dict, division: str) -> List[Dict[str, Any
 
 
 def fetch_exact_mission_freight_rows(token: str) -> List[Dict[str, Any]]:
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-    }
-
-    division = get_division(headers)
-    entries = get_all_purchase_entries(headers, division)
+    division = get_division(token)
+    entries = get_all_purchase_entries(token, division)
 
     supplier_names = sorted(
         list(
@@ -224,6 +231,7 @@ def fetch_exact_mission_freight_rows(token: str) -> List[Dict[str, Any]]:
                 "Exact document id": item.get("EntryID", ""),
                 "Exact boekingsnummer": item.get("EntryNumber", ""),
                 "Exact status": item.get("Status", ""),
+                "Exact division": division,
             }
         )
 
@@ -440,6 +448,7 @@ def merge_exact_and_pdf(exact_rows: List[Dict[str, Any]], pdf_results: List[PdfI
                 "Exact totaal DC": row.get("Exact totaal DC", 0),
                 "Valuta": row.get("Valuta", ""),
                 "Exact status": row.get("Exact status", ""),
+                "Exact division": row.get("Exact division", ""),
             }
         )
 
@@ -465,6 +474,7 @@ def merge_exact_and_pdf(exact_rows: List[Dict[str, Any]], pdf_results: List[PdfI
                 "Exact totaal DC": "",
                 "Valuta": "",
                 "Exact status": "",
+                "Exact division": "",
             }
         )
 
@@ -493,7 +503,7 @@ def build_excel_bytes(df: pd.DataFrame) -> bytes:
 
     for col, width in {
         "A": 16, "B": 18, "C": 14, "D": 22, "E": 12, "F": 14, "G": 16,
-        "H": 24, "I": 18, "J": 18, "K": 18, "L": 24, "M": 14, "N": 12, "O": 14
+        "H": 24, "I": 18, "J": 18, "K": 18, "L": 24, "M": 14, "N": 12, "O": 14, "P": 12
     }.items():
         ws.column_dimensions[col].width = width
 
