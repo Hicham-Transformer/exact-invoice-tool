@@ -88,7 +88,7 @@ def exact_date_to_text(value: Any) -> str:
 
 
 def get_current_division(headers: dict) -> str:
-    res = requests.get(f"{BASE_URL}/current/Me", headers=headers, timeout=30)
+    res = requests.get(f"{BASE_URL}/current/Me?$select=CurrentDivision", headers=headers, timeout=30)
 
     if res.status_code != 200:
         raise RuntimeError(f"Fout bij ophalen division: {res.text}")
@@ -109,7 +109,14 @@ def get_current_division(headers: dict) -> str:
 
 
 def get_all_purchase_entries(headers: dict, division: str) -> List[Dict[str, Any]]:
-    url = f"{BASE_URL}/{division}/purchaseentry/PurchaseEntries?$top=100"
+    url = (
+        f"{BASE_URL}/{division}/purchaseentry/PurchaseEntries"
+        f"?$select=EntryID,InvoiceNumber,EntryNumber,EntryDate,AmountDC,AmountFC,"
+        f"Currency,Supplier,SupplierName,Description,YourRef,OrderNumber,DueDate,"
+        f"Journal,PaymentCondition,Created,Modified,Status"
+        f"&$top=100"
+    )
+
     all_results: List[Dict[str, Any]] = []
 
     while url:
