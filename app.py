@@ -60,32 +60,17 @@ class PdfInvoiceResult:
     status: str
 
 
-def normalize_spaces(text: str) -> str:
-    text = text.replace("\xa0", " ").replace("\u200b", " ")
-    text = re.sub(r"[ \t]+", " ", text)
-    return text
-
-
 def normalize_supplier(text: str) -> str:
     return (text or "").strip().lower()
 
 
-def parse_decimal_eu(value: str) -> Optional[Decimal]:
-    cleaned = value.strip().replace("EUR", "").replace("€", "").replace(" ", "")
-    if not cleaned:
+def safe_json(response) -> Optional[dict]:
+    text = response.text or ""
+    if not text.strip():
         return None
-
-    if "," in cleaned and "." in cleaned:
-        if cleaned.rfind(",") > cleaned.rfind("."):
-            cleaned = cleaned.replace(".", "").replace(",", ".")
-        else:
-            cleaned = cleaned.replace(",", "")
-    elif "," in cleaned:
-        cleaned = cleaned.replace(".", "").replace(",", ".")
-
     try:
-        return Decimal(cleaned)
-    except InvalidOperation:
+        return response.json()
+    except Exception:
         return None
 
 
@@ -100,26 +85,6 @@ def exact_date_to_text(value: Any) -> str:
         except Exception:
             return text
     return text
-
-
-def safe_json(response) -> Optional[dict]:
-    text = response.text or ""
-    if not text.strip():
-        return None
-    try:
-        return response.json()
-    except Exception:
-        return None
-
-
-def extract_exact_results(data: Any) -> list:
-    if isinstance(data, dict):
-        d = data.get("d")
-        if isinstance(d, dict):
-            return d.get("results", [])
-        if isinstance(d, list):
-            return d
-    return []
 
 
 def get_current_division(headers: dict) -> str:
@@ -143,39 +108,52 @@ def get_current_division(headers: dict) -> str:
     raise RuntimeError(f"Division niet gevonden: {text[:300]}")
 
 
-def fetch_all_exact(base_url: str, headers: dict, page_size: int = 50, max_pages: int = 500) -> list:
-    all_rows = []
-    skip = 0
-    page_count = 0
+def get_all_purchase_entries(headers: dict, division: str) -> List[Dict[str, Any]]:
+    url = f"{BASE_URL}/{division}/purchaseentry/PurchaseEntries?$top=100"
+    all_results: List[Dict[str, Any]] = []
 
-    while page_count < max_pages:
-        joiner = "&" if "?" in base_url else "?"
-        url = f"{base_url}{joiner}$top={page_size}&$skip={skip}"
-
+    while url:
         res = requests.get(url, headers=headers, timeout=60)
 
         if res.status_code != 200:
-            print("Exact HTTP error:", res.status_code, res.text[:300])
-            break
+            raise RuntimeError(f"Exact fout: {res.text}")
 
         data = safe_json(res)
         if not data:
-            print("Exact geen JSON:", res.text[:300])
-            break
+            raise RuntimeError(f"Geen JSON van Exact ontvangen: {res.text[:300]}")
 
-        rows = extract_exact_results(data)
-        if not rows:
-            break
+        d = data.get("d", {})
+        results = d.get("results", []) if isinstance(d, dict) else []
+        all_results.extend(results)
 
-        all_rows.extend(rows)
+        url = d.get("__next") if isinstance(d, dict) else None
 
-        if len(rows) < page_size:
-            break
+    return all_results
 
-        skip += page_size
-        page_count += 1
 
-    return all_rows
+def normalize_spaces(text: str) -> str:
+    text = text.replace("\xa0", " ").replace("\u200b", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    return text
+
+
+def parse_decimal_eu(value: str) -> Optional[Decimal]:
+    cleaned = value.strip().replace("EUR", "").replace("€", "").replace(" ", "")
+    if not cleaned:
+        return None
+
+    if "," in cleaned and "." in cleaned:
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    elif "," in cleaned:
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+
+    try:
+        return Decimal(cleaned)
+    except InvalidOperation:
+        return None
 
 
 def extract_text_from_pdf_bytes(data: bytes) -> str:
@@ -345,122 +323,30 @@ def fetch_exact_mission_freight_rows(token: str) -> List[Dict[str, Any]]:
     }
 
     division = get_current_division(headers)
+    entries = get_all_purchase_entries(headers, division)
 
-    purchase_entries_url = (
-        f"{BASE_URL}/{division}/purchaseentry/PurchaseEntries"
-        f"?$select="
-        f"EntryID,"
-        f"InvoiceNumber,"
-        f"EntryNumber,"
-        f"EntryDate,"
-        f"AmountDC,"
-        f"AmountFC,"
-        f"Currency,"
-        f"Supplier,"
-        f"SupplierName,"
-        f"Description,"
-        f"YourRef,"
-        f"OrderNumber,"
-        f"DueDate,"
-        f"Journal,"
-        f"PaymentCondition,"
-        f"Created,"
-        f"Modified"
-    )
-
-    purchase_invoices_url = (
-        f"{BASE_URL}/{division}/purchaseinvoice/PurchaseInvoices"
-        f"?$select="
-        f"InvoiceID,"
-        f"InvoiceNumber,"
-        f"InvoiceDate,"
-        f"AmountDC,"
-        f"AmountFC,"
-        f"Currency,"
-        f"Supplier,"
-        f"SupplierName,"
-        f"Description,"
-        f"YourRef,"
-        f"DueDate,"
-        f"Created,"
-        f"Modified"
-    )
-
-    entry_rows = fetch_all_exact(purchase_entries_url, headers)
-    invoice_rows = fetch_all_exact(purchase_invoices_url, headers)
+    filtered = [
+        e for e in entries
+        if TARGET_SUPPLIER in normalize_supplier(e.get("SupplierName") or "")
+    ]
 
     results: List[Dict[str, Any]] = []
 
-    for item in entry_rows:
-        leverancier = (item.get("SupplierName") or "").strip()
-        if TARGET_SUPPLIER not in normalize_supplier(leverancier):
-            continue
-
+    for item in filtered:
         results.append(
             {
                 "Bron": "PurchaseEntries",
                 "Factuurnummer": str(item.get("InvoiceNumber") or ""),
-                "Exact datum": exact_date_to_text(item.get("EntryDate", "")),
-                "Leverancier": leverancier,
+                "Factuurdatum": exact_date_to_text(item.get("EntryDate", "")),
+                "Leverancier": item.get("SupplierName", ""),
                 "Exact omschrijving": item.get("Description", ""),
                 "Exact totaal DC": item.get("AmountDC", 0),
-                "Exact totaal FC": item.get("AmountFC", 0),
                 "Valuta": item.get("Currency", ""),
                 "Exact document id": item.get("EntryID", ""),
                 "Exact boekingsnummer": item.get("EntryNumber", ""),
-                "Exact referentie": item.get("YourRef", ""),
-                "Exact ordernummer": item.get("OrderNumber", ""),
-                "Exact vervaldatum": exact_date_to_text(item.get("DueDate", "")),
-                "Exact dagboek": item.get("Journal", ""),
-                "Exact betalingsconditie": item.get("PaymentCondition", ""),
-                "Exact leverancier id": item.get("Supplier", ""),
-                "Exact aangemaakt": exact_date_to_text(item.get("Created", "")),
-                "Exact gewijzigd": exact_date_to_text(item.get("Modified", "")),
+                "Exact status": item.get("Status", ""),
             }
         )
-
-    for item in invoice_rows:
-        leverancier = (item.get("SupplierName") or "").strip()
-        if TARGET_SUPPLIER not in normalize_supplier(leverancier):
-            continue
-
-        results.append(
-            {
-                "Bron": "PurchaseInvoices",
-                "Factuurnummer": str(item.get("InvoiceNumber") or ""),
-                "Exact datum": exact_date_to_text(item.get("InvoiceDate", "")),
-                "Leverancier": leverancier,
-                "Exact omschrijving": item.get("Description", ""),
-                "Exact totaal DC": item.get("AmountDC", 0),
-                "Exact totaal FC": item.get("AmountFC", 0),
-                "Valuta": item.get("Currency", ""),
-                "Exact document id": item.get("InvoiceID", ""),
-                "Exact boekingsnummer": "",
-                "Exact referentie": item.get("YourRef", ""),
-                "Exact ordernummer": "",
-                "Exact vervaldatum": exact_date_to_text(item.get("DueDate", "")),
-                "Exact dagboek": "",
-                "Exact betalingsconditie": "",
-                "Exact leverancier id": item.get("Supplier", ""),
-                "Exact aangemaakt": exact_date_to_text(item.get("Created", "")),
-                "Exact gewijzigd": exact_date_to_text(item.get("Modified", "")),
-            }
-        )
-
-    # dedupe op factuurnummer + totaal + datum
-    if results:
-        df = pd.DataFrame(results)
-        df["_dedupe"] = (
-            df["Bron"].astype(str)
-            + "|"
-            + df["Factuurnummer"].astype(str)
-            + "|"
-            + df["Exact datum"].astype(str)
-            + "|"
-            + df["Exact totaal DC"].astype(str)
-        )
-        df = df.drop_duplicates(subset=["_dedupe"]).drop(columns=["_dedupe"])
-        results = df.to_dict(orient="records")
 
     return results
 
@@ -472,7 +358,6 @@ def merge_exact_and_pdf(exact_rows: List[Dict[str, Any]], pdf_results: List[PdfI
             pdf_map[str(p.factuurnummer)] = p
 
     merged_rows: List[Dict[str, Any]] = []
-
     used_pdf_numbers = set()
 
     for row in exact_rows:
@@ -485,7 +370,7 @@ def merge_exact_and_pdf(exact_rows: List[Dict[str, Any]], pdf_results: List[PdfI
             {
                 "Factuurnummer": factuurnummer,
                 "AWB nummer": pdf.awb_nummer if pdf else "",
-                "Factuurdatum": row.get("Exact datum", ""),
+                "Factuurdatum": row.get("Factuurdatum", ""),
                 "Leverancier": row.get("Leverancier", ""),
                 "Totaal kg": pdf.totaal_kg if pdf else None,
                 "Charges (EUR)": pdf.charges_eur if pdf else None,
@@ -495,15 +380,13 @@ def merge_exact_and_pdf(exact_rows: List[Dict[str, Any]], pdf_results: List[PdfI
                 "Bron": row.get("Bron", ""),
                 "Exact document id": row.get("Exact document id", ""),
                 "Exact boekingsnummer": row.get("Exact boekingsnummer", ""),
-                "Exact referentie": row.get("Exact referentie", ""),
-                "Exact ordernummer": row.get("Exact ordernummer", ""),
                 "Exact omschrijving": row.get("Exact omschrijving", ""),
                 "Exact totaal DC": row.get("Exact totaal DC", 0),
                 "Valuta": row.get("Valuta", ""),
+                "Exact status": row.get("Exact status", ""),
             }
         )
 
-    # voeg PDF's toe die niet in Exact matchen
     for p in pdf_results:
         if not p.factuurnummer or p.factuurnummer in used_pdf_numbers:
             continue
@@ -522,11 +405,10 @@ def merge_exact_and_pdf(exact_rows: List[Dict[str, Any]], pdf_results: List[PdfI
                 "Bron": "PDF only",
                 "Exact document id": "",
                 "Exact boekingsnummer": "",
-                "Exact referentie": "",
-                "Exact ordernummer": "",
                 "Exact omschrijving": "",
                 "Exact totaal DC": "",
                 "Valuta": "",
+                "Exact status": "",
             }
         )
 
@@ -538,35 +420,34 @@ def build_excel_bytes(df: pd.DataFrame, pdf_df: pd.DataFrame, exact_df: pd.DataF
     ws = wb.active
     ws.title = "Samengevoegd"
 
-    merged_headers = list(df.columns)
-    ws.append(merged_headers)
+    headers = list(df.columns)
+    ws.append(headers)
 
     fill = PatternFill(fill_type="solid", fgColor="1F4E78")
     font = Font(color="FFFFFF", bold=True)
 
-    for col_idx in range(1, len(merged_headers) + 1):
+    for col_idx in range(1, len(headers) + 1):
         cell = ws.cell(row=1, column=col_idx)
         cell.fill = fill
         cell.font = font
         cell.alignment = Alignment(horizontal="center")
 
     for _, row in df.iterrows():
-        ws.append([row.get(col) for col in merged_headers])
+        ws.append([row.get(col) for col in headers])
 
-    for idx, width in zip(
-        range(1, len(merged_headers) + 1),
-        [18, 18, 14, 22, 12, 14, 16, 24, 20, 18, 18, 18, 18, 24, 14, 12],
-    ):
-        ws.column_dimensions[chr(64 + idx)].width = width
+    widths = {
+        "A": 16, "B": 18, "C": 14, "D": 22, "E": 12, "F": 14, "G": 16,
+        "H": 24, "I": 18, "J": 18, "K": 18, "L": 24, "M": 14, "N": 12, "O": 14
+    }
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
 
-    # tweede sheet: PDF raw
     ws2 = wb.create_sheet("PDF raw")
     if not pdf_df.empty:
         ws2.append(list(pdf_df.columns))
         for _, row in pdf_df.iterrows():
             ws2.append([row.get(col) for col in pdf_df.columns])
 
-    # derde sheet: Exact raw
     ws3 = wb.create_sheet("Exact raw")
     if not exact_df.empty:
         ws3.append(list(exact_df.columns))
@@ -591,82 +472,23 @@ HTML = """
 <html lang="nl">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Exact + PDF Mission Freight Tool</title>
   <style>
-    :root {
-      --bg: #f5f7fb;
-      --card: #ffffff;
-      --text: #14213d;
-      --muted: #5b6475;
-      --primary: #2563eb;
-      --border: #dbe2f0;
-      --ok: #117a37;
-      --warn: #b26a00;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-    }
-    .wrap {
-      max-width: 1000px;
-      margin: 0 auto;
-      padding: 18px;
-    }
-    .card {
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 18px;
-      padding: 20px;
-      box-shadow: 0 8px 24px rgba(20, 33, 61, 0.06);
-      margin-bottom: 16px;
-    }
-    h1 { font-size: 1.55rem; margin: 0 0 8px; }
-    h2 { font-size: 1.2rem; margin: 0 0 12px; }
-    p { margin: 0 0 10px; color: var(--muted); line-height: 1.5; }
-    .btn {
-      display: inline-block;
-      border: 0;
-      border-radius: 14px;
-      padding: 14px 16px;
-      font-size: 16px;
-      font-weight: 600;
-      text-decoration: none;
-      text-align: center;
-      margin-top: 12px;
-      cursor: pointer;
-      background: var(--primary);
-      color: white;
-    }
-    .btn-secondary {
-      background: #eef3ff;
-      color: var(--primary);
-    }
-    input[type=file] {
-      width: 100%;
-      margin-top: 12px;
-      font-size: 16px;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 14px;
-    }
-    th, td {
-      padding: 10px;
-      border-bottom: 1px solid var(--border);
-      text-align: left;
-      vertical-align: top;
-    }
-    th {
-      color: var(--muted);
-      font-weight: 600;
-    }
-    .ok { color: var(--ok); font-weight: 700; }
-    .warn { color: var(--warn); font-weight: 700; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; background: #f5f7fb; margin: 0; padding: 18px; color: #14213d; }
+    .wrap { max-width: 1000px; margin: 0 auto; }
+    .card { background: white; border: 1px solid #dbe2f0; border-radius: 18px; padding: 20px; margin-bottom: 16px; }
+    h1 { margin: 0 0 10px; font-size: 1.7rem; }
+    h2 { margin: 0 0 10px; font-size: 1.25rem; }
+    p { color: #5b6475; line-height: 1.5; }
+    .btn { display: inline-block; background: #2563eb; color: white; padding: 14px 18px; border-radius: 14px; text-decoration: none; font-weight: 700; border: 0; cursor: pointer; margin-top: 10px; }
+    .btn-secondary { background: #eef3ff; color: #2563eb; }
+    input[type=file] { width: 100%; margin-top: 12px; font-size: 16px; }
+    .ok { color: #117a37; font-weight: 700; }
+    .warn { color: #b26a00; font-weight: 700; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { padding: 10px; border-bottom: 1px solid #dbe2f0; text-align: left; vertical-align: top; }
+    th { color: #5b6475; }
   </style>
 </head>
 <body>
@@ -679,7 +501,7 @@ HTML = """
 
       {% if connected %}
         <p class="ok">Exact is gekoppeld.</p>
-        <a class="btn" href="{{ url_for('sync_exact') }}">1. Haal Mission Freight uit Exact</a>
+        <a class="btn" href="{{ url_for('fetch_exact') }}">1. Haal Mission Freight uit Exact</a>
       {% else %}
         <a class="btn" href="{{ url_for('login') }}">Login met Exact</a>
       {% endif %}
@@ -816,8 +638,8 @@ def callback():
     return redirect(url_for("index"))
 
 
-@app.route("/sync-exact")
-def sync_exact():
+@app.route("/fetch_exact")
+def fetch_exact():
     try:
         token = session.get("access_token")
         if not token:
@@ -827,7 +649,6 @@ def sync_exact():
         exact_df = pd.DataFrame(exact_rows)
         session["exact_json"] = exact_df.to_json(orient="records")
 
-        # merge opnieuw als pdf al bestaat
         pdf_df = session_get_df("pdf_json")
         pdf_results = []
         if not pdf_df.empty:
@@ -843,12 +664,13 @@ def sync_exact():
                         status=r.get("Status"),
                     )
                 )
+
         merged_df = merge_exact_and_pdf(exact_rows, pdf_results)
         session["merged_json"] = merged_df.to_json(orient="records")
 
         return redirect(url_for("index"))
     except Exception as e:
-        return f"Fout bij Exact sync: {str(e)}", 500
+        return f"Fout bij ophalen Exact data: {str(e)}", 500
 
 
 @app.route("/upload-pdfs", methods=["POST"])
