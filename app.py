@@ -1,38 +1,44 @@
-from flask import Flask, redirect, request, session, send_file, url_for
-import requests
 import os
-import io
-import pandas as pd
+import requests
+import tempfile
 import re
-from datetime import datetime
-
-try:
-    import fitz  # pymupdf
-except:
-    fitz = None
+from flask import Flask, redirect, request, session, send_file
+from urllib.parse import urlencode
+import pdfplumber
+import pandas as pd
 
 app = Flask(__name__)
-app.secret_key = "supersecret"
+app.secret_key = os.environ.get("SECRET_KEY", "supersecret")
 
-# ================= MICROSOFT CONFIG =================
-CLIENT_ID = os.getenv("MS_CLIENT_ID")
-CLIENT_SECRET = os.getenv("MS_CLIENT_SECRET")
-REDIRECT_URI = os.getenv("MS_REDIRECT_URI")
+# ENV VARS (Render)
+CLIENT_ID = os.environ.get("MS_CLIENT_ID")
+CLIENT_SECRET = os.environ.get("MS_CLIENT_SECRET")
+REDIRECT_URI = os.environ.get("MS_REDIRECT_URI")
+TENANT_ID = os.environ.get("MS_TENANT_ID", "common")
 
-AUTH_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
-TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
-GRAPH_URL = "https://graph.microsoft.com/v1.0"
+AUTH_URL = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/authorize"
+TOKEN_URL = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+GRAPH_API = "https://graph.microsoft.com/v1.0"
+
+SCOPES = [
+    "User.Read",
+    "Mail.Read",
+    "offline_access"
+]
 
 
-# ================= LOGIN =================
+# ---------------- LOGIN ----------------
+
 @app.route("/login")
 def login():
-    return redirect(
-        f"{AUTH_URL}?client_id={CLIENT_ID}"
-        f"&response_type=code"
-        f"&redirect_uri={REDIRECT_URI}"
-        f"&scope=offline_access Mail.Read"
-    )
+    params = {
+        "client_id": CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": REDIRECT_URI,
+        "response_mode": "query",
+        "scope": " ".join(SCOPES)
+    }
+    return redirect(f"{AUTH_URL}?{urlencode(params)}")
 
 
 @app.route("/callback")
@@ -41,56 +47,67 @@ def callback():
 
     data = {
         "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
+        "scope": " ".join(SCOPES),
         "code": code,
         "redirect_uri": REDIRECT_URI,
         "grant_type": "authorization_code",
+        "client_secret": CLIENT_SECRET
     }
 
-    r = requests.post(TOKEN_URL, data=data)
-    token = r.json()
+    token_res = requests.post(TOKEN_URL, data=data).json()
 
-    session["access_token"] = token["access_token"]
+    if "access_token" not in token_res:
+        return f"Token error: {token_res}"
 
-    return redirect("/fetch")
+    session["access_token"] = token_res["access_token"]
+
+    return "Login succesvol ✅ Ga naar /fetch-mails"
 
 
-# ================= PDF PARSER =================
-def extract_pdf_data(pdf_bytes):
-    if not fitz:
-        return {}
+# ---------------- FETCH MAILS ----------------
 
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    text = ""
-
-    for page in doc:
-        text += page.get_text()
-
-    factuur = re.search(r"FACTUURNUMMER\s*(\d+)", text)
-    awb = re.search(r"(\d{3}-\d{8})", text)
-    kg = re.search(r"bruto.*?(\d+[.,]\d+)", text.lower())
-    charge = re.search(r"warehouse.*?(\d+[.,]\d+)", text.lower())
-
+def get_headers():
     return {
-        "Factuurnummer": factuur.group(1) if factuur else "",
-        "AWB": awb.group(1) if awb else "",
-        "KG": float(kg.group(1).replace(",", ".")) if kg else "",
-        "Charges": float(charge.group(1).replace(",", ".")) if charge else "",
+        "Authorization": f"Bearer {session.get('access_token')}"
     }
 
 
-# ================= FETCH OUTLOOK =================
-@app.route("/fetch")
-def fetch():
-    token = session.get("access_token")
+def extract_pdf_data(pdf_path):
+    data = {
+        "awb": None,
+        "kg": None,
+        "charges": None
+    }
 
-    if not token:
-        return redirect("/login")
+    with pdfplumber.open(pdf_path) as pdf:
+        text = ""
+        for page in pdf.pages:
+            text += page.extract_text() + "\n"
 
-    headers = {"Authorization": f"Bearer {token}"}
+    # AWB (voorbeeld patroon)
+    awb_match = re.search(r"\d{3}-\d{8}", text)
+    if awb_match:
+        data["awb"] = awb_match.group()
 
-    # 🔍 Zoek map
-    folders = requests.get(f"{GRAPH_URL}/me/mailFolders", headers=headers).json()
+    # KG
+    kg_match = re.search(r"(\d+(\.\d+)?)\s?KG", text, re.IGNORECASE)
+    if kg_match:
+        data["kg"] = float(kg_match.group(1))
+
+    # Charges (handling etc.)
+    charge_match = re.search(r"(\d+(\.\d+)?)\s?EUR", text)
+    if charge_match:
+        data["charges"] = float(charge_match.group(1))
+
+    return data
+
+
+@app.route("/fetch-mails")
+def fetch_mails():
+    headers = get_headers()
+
+    # 📂 Folder ophalen (facturen verwerkt)
+    folders = requests.get(f"{GRAPH_API}/me/mailFolders", headers=headers).json()
 
     folder_id = None
     for f in folders.get("value", []):
@@ -100,67 +117,73 @@ def fetch():
     if not folder_id:
         return "Map 'facturen verwerkt' niet gevonden"
 
-    # 📥 Haal mails
-    messages = requests.get(
-        f"{GRAPH_URL}/me/mailFolders/{folder_id}/messages?$top=50",
-        headers=headers,
+    # 📧 Mails ophalen
+    mails = requests.get(
+        f"{GRAPH_API}/me/mailFolders/{folder_id}/messages?$top=20",
+        headers=headers
     ).json()
 
-    rows = []
+    results = []
 
-    for msg in messages.get("value", []):
-        sender = msg["from"]["emailAddress"]["address"]
+    for mail in mails.get("value", []):
+        sender = mail.get("from", {}).get("emailAddress", {}).get("address", "")
 
-        if sender.lower() != "s.gasior@missionfreight.nl":
+        # 🔒 filter op afzender
+        if "missionfreight.nl" not in sender:
             continue
 
-        msg_id = msg["id"]
+        msg_id = mail["id"]
 
         attachments = requests.get(
-            f"{GRAPH_URL}/me/messages/{msg_id}/attachments",
-            headers=headers,
+            f"{GRAPH_API}/me/messages/{msg_id}/attachments",
+            headers=headers
         ).json()
 
         for att in attachments.get("value", []):
-            if att.get("contentType") == "application/pdf":
-                content = att.get("contentBytes")
+            if att.get("@odata.type") == "#microsoft.graph.fileAttachment":
+                if att["name"].lower().endswith(".pdf"):
 
-                import base64
-                pdf_bytes = base64.b64decode(content)
+                    file_data = att["contentBytes"]
 
-                data = extract_pdf_data(pdf_bytes)
+                    temp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+                    temp.write(requests.utils.unquote_to_bytes(file_data))
+                    temp.close()
 
-                rows.append({
-                    "Datum": msg["receivedDateTime"],
-                    "Afzender": sender,
-                    "Bestandsnaam": att["name"],
-                    **data
-                })
+                    parsed = extract_pdf_data(temp.name)
 
-    if not rows:
-        return "Geen PDF facturen gevonden"
+                    if parsed["kg"] and parsed["charges"]:
+                        price_per_kg = parsed["charges"] / parsed["kg"]
+                    else:
+                        price_per_kg = None
 
-    df = pd.DataFrame(rows)
+                    parsed["price_per_kg"] = price_per_kg
 
-    output = io.BytesIO()
-    df.to_excel(output, index=False)
-    output.seek(0)
+                    results.append(parsed)
 
-    return send_file(
-        output,
-        download_name="outlook_facturen.xlsx",
-        as_attachment=True
-    )
+    if not results:
+        return "Geen data gevonden"
+
+    # 📊 Excel maken
+    df = pd.DataFrame(results)
+
+    file_path = "output.xlsx"
+    df.to_excel(file_path, index=False)
+
+    return send_file(file_path, as_attachment=True)
 
 
-# ================= HOME =================
+# ---------------- ROOT ----------------
+
 @app.route("/")
 def home():
     return """
-    <h2>Outlook Factuur Tool</h2>
-    <a href="/login">Login met Outlook</a>
+    <h2>Outlook PDF Tool</h2>
+    <a href="/login">Login met Outlook</a><br><br>
+    <a href="/fetch-mails">Haal facturen op</a>
     """
-    
+
+
+# ---------------- RUN ----------------
 
 if __name__ == "__main__":
-    app.run()
+    app.run(host="0.0.0.0", port=10000)
