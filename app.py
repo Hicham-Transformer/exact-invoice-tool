@@ -1,7 +1,6 @@
 import os
 import io
 import re
-import json
 import base64
 from urllib.parse import urlencode
 
@@ -35,14 +34,13 @@ SCOPES = [
 TARGET_FOLDER_NAME = "facturen verwerkt"
 TARGET_SENDER = "s.gasior@missionfreight.nl"
 
-DEFAULT_LIMIT = 20
-MAX_LIMIT = 50
+BATCH_SIZE = 20
+MAX_BATCHES = 50
 
 
 @app.route("/")
 def home():
-    total_rows = len(session.get("collected_rows", []))
-    return f"""
+    return """
     <html>
       <head>
         <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -51,12 +49,8 @@ def home():
       <body style="font-family: Arial, sans-serif; padding: 24px;">
         <h2>Outlook PDF Tool</h2>
         <p><a href="/login">Login met Outlook</a></p>
-        <p><a href="/fetch-batch?page=1&limit=20">Verwerk batch 1</a></p>
-        <p><a href="/fetch-batch?page=2&limit=20">Verwerk batch 2</a></p>
-        <p><a href="/fetch-batch?page=3&limit=20">Verwerk batch 3</a></p>
-        <p><a href="/download-excel">Download Excel</a></p>
-        <p><a href="/reset-batches">Reset verzamelde data</a></p>
-        <p>Verzamelde rijen: <strong>{total_rows}</strong></p>
+        <p><a href="/fetch-all-auto">Haal alles automatisch op in 1 Excel</a></p>
+        <p><a href="/health">Health check</a></p>
       </body>
     </html>
     """
@@ -108,7 +102,7 @@ def callback():
     if "refresh_token" in token_json:
         session["refresh_token"] = token_json["refresh_token"]
 
-    return "Login succesvol ✅ Ga nu naar /fetch-batch?page=1&limit=20"
+    return "Login succesvol ✅ Ga nu naar /fetch-all-auto"
 
 
 def get_headers():
@@ -119,7 +113,7 @@ def get_headers():
 
 
 def graph_get(url: str):
-    response = requests.get(url, headers=get_headers(), timeout=30)
+    response = requests.get(url, headers=get_headers(), timeout=60)
     try:
         data = response.json()
     except Exception:
@@ -277,147 +271,129 @@ def extract_pdf_data(pdf_bytes: bytes):
         return result
 
 
-@app.route("/fetch-batch")
-def fetch_batch():
+def fetch_one_batch(folder_id: str, page: int, limit: int):
+    skip = (page - 1) * limit
+
+    messages_url = (
+        f"{GRAPH_API}/me/mailFolders/{folder_id}/messages"
+        f"?$top={limit}"
+        f"&$skip={skip}"
+        "&$select=id,subject,receivedDateTime,from,hasAttachments"
+        "&$orderby=receivedDateTime desc"
+    )
+
+    messages_data = graph_get(messages_url)
+    messages = messages_data.get("value", [])
+    rows = []
+
+    for mail in messages:
+        sender = (
+            mail.get("from", {})
+            .get("emailAddress", {})
+            .get("address", "")
+            .strip()
+            .lower()
+        )
+
+        if TARGET_SENDER not in sender:
+            continue
+
+        if not mail.get("hasAttachments"):
+            continue
+
+        msg_id = mail["id"]
+        attachments_url = f"{GRAPH_API}/me/messages/{msg_id}/attachments?$top=50"
+        attachments_data = graph_get(attachments_url)
+        attachments = attachments_data.get("value", [])
+
+        for att in attachments:
+            if att.get("@odata.type") != "#microsoft.graph.fileAttachment":
+                continue
+
+            filename = att.get("name", "")
+            if not filename.lower().endswith(".pdf"):
+                continue
+
+            content_b64 = att.get("contentBytes")
+            if not content_b64:
+                continue
+
+            pdf_bytes = base64.b64decode(content_b64)
+            parsed = extract_pdf_data(pdf_bytes)
+
+            rows.append(
+                {
+                    "Pagina": page,
+                    "Datum email": mail.get("receivedDateTime", ""),
+                    "Afzender": sender,
+                    "Onderwerp": mail.get("subject", ""),
+                    "Bestandsnaam": filename,
+                    "Factuurnummer": parsed.get("Factuurnummer", ""),
+                    "Factuurdatum": parsed.get("Factuurdatum", ""),
+                    "AWB": parsed.get("AWB", ""),
+                    "KG": parsed.get("KG", ""),
+                    "Charge omschrijving": parsed.get("Charge omschrijving", ""),
+                    "Charges": parsed.get("Charges", ""),
+                    "Prijs_per_KG": parsed.get("Prijs_per_KG", ""),
+                    "Status": parsed.get("Status", ""),
+                }
+            )
+
+    return rows, len(messages)
+
+
+@app.route("/fetch-all-auto")
+def fetch_all_auto():
     try:
         if "access_token" not in session:
             return redirect("/login")
-
-        try:
-            limit = int(request.args.get("limit", DEFAULT_LIMIT))
-        except Exception:
-            limit = DEFAULT_LIMIT
-
-        try:
-            page = int(request.args.get("page", 1))
-        except Exception:
-            page = 1
-
-        if limit < 1:
-            limit = DEFAULT_LIMIT
-        if limit > MAX_LIMIT:
-            limit = MAX_LIMIT
-        if page < 1:
-            page = 1
-
-        skip = (page - 1) * limit
 
         folder_id = find_folder_under_inbox(TARGET_FOLDER_NAME)
         if not folder_id:
             return "Map 'Inbox > facturen verwerkt' niet gevonden"
 
-        messages_url = (
-            f"{GRAPH_API}/me/mailFolders/{folder_id}/messages"
-            f"?$top={limit}"
-            f"&$skip={skip}"
-            "&$select=id,subject,receivedDateTime,from,hasAttachments"
-            "&$orderby=receivedDateTime desc"
-        )
+        all_rows = []
+        page = 1
 
-        messages_data = graph_get(messages_url)
-        messages = messages_data.get("value", [])
+        while page <= MAX_BATCHES:
+            batch_rows, raw_message_count = fetch_one_batch(folder_id, page, BATCH_SIZE)
 
-        batch_rows = []
+            if raw_message_count == 0:
+                break
 
-        for mail in messages:
-            sender = (
-                mail.get("from", {})
-                .get("emailAddress", {})
-                .get("address", "")
-                .strip()
-                .lower()
+            all_rows.extend(batch_rows)
+
+            # als deze pagina minder messages heeft dan batch size, zijn we aan het einde
+            if raw_message_count < BATCH_SIZE:
+                break
+
+            page += 1
+
+        if not all_rows:
+            return (
+                f"Geen PDF facturen gevonden van {TARGET_SENDER} "
+                f"in map 'Inbox > {TARGET_FOLDER_NAME}'"
             )
 
-            if TARGET_SENDER not in sender:
-                continue
+        df = pd.DataFrame(all_rows)
 
-            if not mail.get("hasAttachments"):
-                continue
-
-            msg_id = mail["id"]
-            attachments_url = f"{GRAPH_API}/me/messages/{msg_id}/attachments?$top=50"
-            attachments_data = graph_get(attachments_url)
-            attachments = attachments_data.get("value", [])
-
-            for att in attachments:
-                if att.get("@odata.type") != "#microsoft.graph.fileAttachment":
-                    continue
-
-                filename = att.get("name", "")
-                if not filename.lower().endswith(".pdf"):
-                    continue
-
-                content_b64 = att.get("contentBytes")
-                if not content_b64:
-                    continue
-
-                pdf_bytes = base64.b64decode(content_b64)
-                parsed = extract_pdf_data(pdf_bytes)
-
-                batch_rows.append(
-                    {
-                        "Pagina": page,
-                        "Datum email": mail.get("receivedDateTime", ""),
-                        "Afzender": sender,
-                        "Onderwerp": mail.get("subject", ""),
-                        "Bestandsnaam": filename,
-                        "Factuurnummer": parsed.get("Factuurnummer", ""),
-                        "Factuurdatum": parsed.get("Factuurdatum", ""),
-                        "AWB": parsed.get("AWB", ""),
-                        "KG": parsed.get("KG", ""),
-                        "Charge omschrijving": parsed.get("Charge omschrijving", ""),
-                        "Charges": parsed.get("Charges", ""),
-                        "Prijs_per_KG": parsed.get("Prijs_per_KG", ""),
-                        "Status": parsed.get("Status", ""),
-                    }
-                )
-
-        existing_rows = session.get("collected_rows", [])
-        combined_rows = existing_rows + batch_rows
-
-        if combined_rows:
-            df = pd.DataFrame(combined_rows)
+        if "Factuurnummer" in df.columns:
             df = df.sort_values(by=["Datum email"], ascending=False)
             df = df.drop_duplicates(subset=["Factuurnummer", "Bestandsnaam"], keep="first")
-            session["collected_rows"] = df.to_dict(orient="records")
-        else:
-            session["collected_rows"] = []
 
-        return (
-            f"Batch {page} verwerkt ✅ "
-            f"Toegevoegd: {len(batch_rows)} rijen. "
-            f"Totaal verzameld: {len(session.get('collected_rows', []))}. "
-            f"Ga nu naar /download-excel of verwerk volgende batch."
+        output = io.BytesIO()
+        df.to_excel(output, index=False, engine="openpyxl")
+        output.seek(0)
+
+        return send_file(
+            output,
+            download_name="outlook_facturen_all.xlsx",
+            as_attachment=True,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
     except Exception as e:
-        return f"Fout in fetch-batch: {e}", 500
-
-
-@app.route("/download-excel")
-def download_excel():
-    rows = session.get("collected_rows", [])
-
-    if not rows:
-        return "Nog geen batches verwerkt. Gebruik eerst /fetch-batch?page=1&limit=20"
-
-    df = pd.DataFrame(rows)
-    output = io.BytesIO()
-    df.to_excel(output, index=False, engine="openpyxl")
-    output.seek(0)
-
-    return send_file(
-        output,
-        download_name="outlook_facturen_all_batches.xlsx",
-        as_attachment=True,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-
-@app.route("/reset-batches")
-def reset_batches():
-    session["collected_rows"] = []
-    return "Verzamelde batch-data is gereset ✅"
+        return f"Fout in fetch-all-auto: {e}", 500
 
 
 @app.route("/health")
