@@ -14,7 +14,6 @@ try:
 except Exception:
     pdfplumber = None
 
-
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "supersecret-dev-key")
 
@@ -36,8 +35,9 @@ SCOPES = [
     "offline_access",
 ]
 
-TARGET_SENDER = "s.gasior@missionfreight.nl"
 TARGET_FOLDER_NAME = "facturen verwerkt"
+TARGET_SENDER = "s.gasior@missionfreight.nl"
+MAX_MESSAGES = 50
 
 
 # =========================
@@ -67,10 +67,7 @@ def home():
 @app.route("/login")
 def login():
     if not CLIENT_ID or not CLIENT_SECRET or not REDIRECT_URI:
-        return (
-            "MS_CLIENT_ID, MS_CLIENT_SECRET of MS_REDIRECT_URI ontbreekt in Render Environment.",
-            500,
-        )
+        return "MS_CLIENT_ID, MS_CLIENT_SECRET of MS_REDIRECT_URI ontbreekt.", 500
 
     params = {
         "client_id": CLIENT_ID,
@@ -92,7 +89,7 @@ def callback():
         return f"Microsoft login fout: {error} - {error_desc}", 400
 
     if not code:
-        return "Geen authorization code ontvangen van Microsoft.", 400
+        return "Geen authorization code ontvangen.", 400
 
     data = {
         "client_id": CLIENT_ID,
@@ -104,10 +101,7 @@ def callback():
     }
 
     response = requests.post(TOKEN_URL, data=data, timeout=30)
-    try:
-        token_json = response.json()
-    except Exception:
-        return f"Token response niet leesbaar: {response.text}", 400
+    token_json = response.json()
 
     if response.status_code != 200 or "access_token" not in token_json:
         return f"Token error: {token_json}", 400
@@ -129,15 +123,12 @@ def get_headers():
     return {"Authorization": f"Bearer {token}"}
 
 
-def graph_get(url):
+def graph_get(url: str):
     response = requests.get(url, headers=get_headers(), timeout=30)
-
     try:
         data = response.json()
     except Exception:
-        raise RuntimeError(
-            f"Graph response niet leesbaar. HTTP {response.status_code}: {response.text}"
-        )
+        raise RuntimeError(f"Graph response niet leesbaar: HTTP {response.status_code} - {response.text}")
 
     if response.status_code != 200:
         raise RuntimeError(f"Graph fout {response.status_code}: {data}")
@@ -145,78 +136,45 @@ def graph_get(url):
     return data
 
 
-def graph_get_all(url):
+def find_folder_under_inbox(folder_name: str):
     """
-    Haalt alle pagina's op via @odata.nextLink
+    Zoekt alleen onder de welbekende Graph folder 'inbox'.
+    Dit is veel sneller dan heel de mailbox doorzoeken.
     """
-    all_items = []
+    folder_name = folder_name.strip().lower()
+    url = f"{GRAPH_API}/me/mailFolders/inbox/childFolders?$top=200"
+    data = graph_get(url)
 
-    while url:
-        data = graph_get(url)
-        all_items.extend(data.get("value", []))
-        url = data.get("@odata.nextLink")
+    for folder in data.get("value", []):
+        if (folder.get("displayName") or "").strip().lower() == folder_name:
+            return folder["id"]
 
-    return all_items
-
-
-def find_folder_recursive(target_name):
-    """
-    Zoekt recursief in ALLE mappen en submappen op displayName.
-    """
-    target_name = target_name.strip().lower()
-
-    def search(folder_id=None):
-        if folder_id:
-            url = f"{GRAPH_API}/me/mailFolders/{folder_id}/childFolders?$top=200"
-        else:
-            url = f"{GRAPH_API}/me/mailFolders?$top=200"
-
-        folders = graph_get_all(url)
-
-        for folder in folders:
-            name = (folder.get("displayName") or "").strip().lower()
-
-            if name == target_name:
-                return folder["id"]
-
-            found = search(folder["id"])
-            if found:
-                return found
-
-        return None
-
-    return search()
+    return None
 
 
-def parse_decimal(value):
-    """
-    Zet '102,54' om naar 102.54
-    """
-    if value in (None, ""):
+def parse_decimal(value: str):
+    if not value:
         return ""
-
-    text = str(value).strip()
-    text = text.replace(".", "").replace(",", ".")
+    text = str(value).strip().replace(".", "").replace(",", ".")
     try:
         return float(text)
     except Exception:
         return ""
 
 
-def extract_pdf_text(pdf_bytes):
+def extract_pdf_text(pdf_bytes: bytes) -> str:
     if pdfplumber is None:
-        raise RuntimeError("pdfplumber niet geïnstalleerd. Zet pdfplumber in requirements.txt.")
+        raise RuntimeError("pdfplumber niet geïnstalleerd")
 
     text = ""
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
-            extracted = page.extract_text()
-            if extracted:
-                text += extracted + "\n"
+            page_text = page.extract_text() or ""
+            text += page_text + "\n"
     return text
 
 
-def extract_pdf_data(pdf_bytes):
+def extract_pdf_data(pdf_bytes: bytes):
     result = {
         "Factuurnummer": "",
         "Factuurdatum": "",
@@ -231,26 +189,19 @@ def extract_pdf_data(pdf_bytes):
     try:
         text = extract_pdf_text(pdf_bytes)
 
-        # Factuurnummer
         invoice_match = re.search(r"FACTUURNUMMER\s+([0-9]{5,})", text, re.IGNORECASE)
         if invoice_match:
             result["Factuurnummer"] = invoice_match.group(1)
 
-        # Factuurdatum
-        date_match = re.search(
-            r"FACTUURDATUM\s+([0-9]{2}-[A-Za-z]{3}-[0-9]{4})",
-            text,
-            re.IGNORECASE,
-        )
+        date_match = re.search(r"FACTUURDATUM\s+([0-9]{2}-[A-Za-z]{3}-[0-9]{4})", text, re.IGNORECASE)
         if date_match:
             result["Factuurdatum"] = date_match.group(1)
 
-        # AWB
         awb_match = re.search(r"\b\d{3}-\d{8}\b", text)
         if awb_match:
             result["AWB"] = awb_match.group(0)
 
-        # KG - afgestemd op Mission Freight layout
+        # Voor Mission Freight voorbeeld
         goods_match = re.search(
             r"\bCOLLI\b.*?E-COMMERCE\s+(\d+(?:[.,]\d+)?)\s+\d+(?:[.,]\d+)?",
             text,
@@ -263,7 +214,6 @@ def extract_pdf_data(pdf_bytes):
             if kg_match:
                 result["KG"] = parse_decimal(kg_match.group(1))
 
-        # Charges: warehouse / handling fee / handling charges
         charge_patterns = [
             r"(Import warehouse charges)\s+.*?EUR\s+(\d+(?:[.,]\d+)?)",
             r"(Handling fee)\s+.*?EUR\s+(\d+(?:[.,]\d+)?)",
@@ -277,13 +227,9 @@ def extract_pdf_data(pdf_bytes):
                 result["Charges"] = parse_decimal(charge_match.group(2))
                 break
 
-        # Prijs per KG
         if result["KG"] != "" and result["Charges"] != "":
             try:
-                result["Prijs_per_KG"] = round(
-                    float(result["Charges"]) / float(result["KG"]),
-                    5,
-                )
+                result["Prijs_per_KG"] = round(float(result["Charges"]) / float(result["KG"]), 5)
             except Exception:
                 result["Prijs_per_KG"] = ""
 
@@ -314,113 +260,76 @@ def fetch_mails():
         if "access_token" not in session:
             return redirect("/login")
 
-        folder_id = find_folder_recursive(TARGET_FOLDER_NAME)
-
+        folder_id = find_folder_under_inbox(TARGET_FOLDER_NAME)
         if not folder_id:
-            return "Map 'facturen verwerkt' niet gevonden"
+            return "Map 'Inbox > facturen verwerkt' niet gevonden"
 
         messages_url = (
             f"{GRAPH_API}/me/mailFolders/{folder_id}/messages"
-            "?$top=100"
+            f"?$top={MAX_MESSAGES}"
             "&$select=id,subject,receivedDateTime,from,hasAttachments"
+            "&$orderby=receivedDateTime desc"
         )
-        messages = graph_get_all(messages_url)
+        messages_data = graph_get(messages_url)
+        messages = messages_data.get("value", [])
 
         rows = []
 
         for mail in messages:
-            try:
-                sender = (
-                    mail.get("from", {})
-                    .get("emailAddress", {})
-                    .get("address", "")
-                    .strip()
-                    .lower()
-                )
+            sender = (
+                mail.get("from", {})
+                .get("emailAddress", {})
+                .get("address", "")
+                .strip()
+                .lower()
+            )
 
-                if TARGET_SENDER not in sender:
+            if TARGET_SENDER not in sender:
+                continue
+
+            if not mail.get("hasAttachments"):
+                continue
+
+            msg_id = mail["id"]
+            attachments_url = f"{GRAPH_API}/me/messages/{msg_id}/attachments"
+            attachments_data = graph_get(attachments_url)
+
+            for att in attachments_data.get("value", []):
+                if att.get("@odata.type") != "#microsoft.graph.fileAttachment":
                     continue
 
-                if not mail.get("hasAttachments"):
+                filename = att.get("name", "")
+                if not filename.lower().endswith(".pdf"):
                     continue
 
-                msg_id = mail["id"]
-                attachments_url = f"{GRAPH_API}/me/messages/{msg_id}/attachments"
-                attachments = graph_get_all(attachments_url)
+                content_b64 = att.get("contentBytes")
+                if not content_b64:
+                    continue
 
-                for att in attachments:
-                    try:
-                        if att.get("@odata.type") != "#microsoft.graph.fileAttachment":
-                            continue
+                pdf_bytes = base64.b64decode(content_b64)
+                parsed = extract_pdf_data(pdf_bytes)
 
-                        filename = att.get("name", "")
-                        if not filename.lower().endswith(".pdf"):
-                            continue
-
-                        content_b64 = att.get("contentBytes")
-                        if not content_b64:
-                            continue
-
-                        pdf_bytes = base64.b64decode(content_b64)
-                        parsed = extract_pdf_data(pdf_bytes)
-
-                        rows.append(
-                            {
-                                "Datum email": mail.get("receivedDateTime", ""),
-                                "Afzender": sender,
-                                "Onderwerp": mail.get("subject", ""),
-                                "Bestandsnaam": filename,
-                                "Factuurnummer": parsed.get("Factuurnummer", ""),
-                                "Factuurdatum": parsed.get("Factuurdatum", ""),
-                                "AWB": parsed.get("AWB", ""),
-                                "KG": parsed.get("KG", ""),
-                                "Charge omschrijving": parsed.get("Charge omschrijving", ""),
-                                "Charges": parsed.get("Charges", ""),
-                                "Prijs_per_KG": parsed.get("Prijs_per_KG", ""),
-                                "Status": parsed.get("Status", ""),
-                            }
-                        )
-
-                    except Exception as att_err:
-                        rows.append(
-                            {
-                                "Datum email": mail.get("receivedDateTime", ""),
-                                "Afzender": sender,
-                                "Onderwerp": mail.get("subject", ""),
-                                "Bestandsnaam": att.get("name", ""),
-                                "Factuurnummer": "",
-                                "Factuurdatum": "",
-                                "AWB": "",
-                                "KG": "",
-                                "Charge omschrijving": "",
-                                "Charges": "",
-                                "Prijs_per_KG": "",
-                                "Status": f"Attachment fout: {att_err}",
-                            }
-                        )
-
-            except Exception as mail_err:
                 rows.append(
                     {
                         "Datum email": mail.get("receivedDateTime", ""),
-                        "Afzender": "",
+                        "Afzender": sender,
                         "Onderwerp": mail.get("subject", ""),
-                        "Bestandsnaam": "",
-                        "Factuurnummer": "",
-                        "Factuurdatum": "",
-                        "AWB": "",
-                        "KG": "",
-                        "Charge omschrijving": "",
-                        "Charges": "",
-                        "Prijs_per_KG": "",
-                        "Status": f"Mail fout: {mail_err}",
+                        "Bestandsnaam": filename,
+                        "Factuurnummer": parsed.get("Factuurnummer", ""),
+                        "Factuurdatum": parsed.get("Factuurdatum", ""),
+                        "AWB": parsed.get("AWB", ""),
+                        "KG": parsed.get("KG", ""),
+                        "Charge omschrijving": parsed.get("Charge omschrijving", ""),
+                        "Charges": parsed.get("Charges", ""),
+                        "Prijs_per_KG": parsed.get("Prijs_per_KG", ""),
+                        "Status": parsed.get("Status", ""),
                     }
                 )
 
         if not rows:
             return (
                 "Geen PDF facturen gevonden van s.gasior@missionfreight.nl "
-                "in map 'facturen verwerkt'"
+                "in map 'Inbox > facturen verwerkt'"
             )
 
         df = pd.DataFrame(rows)
