@@ -3,3 +3,4 @@ requests
 pdfplumber
 pandas
 openpyxl
+gunicorn
