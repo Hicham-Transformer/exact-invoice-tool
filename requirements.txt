@@ -1,6 +1,5 @@
 flask
 requests
+pdfplumber
 pandas
 openpyxl
-pymupdf
-gunicorn
