@@ -144,7 +144,7 @@ def parse_decimal_eu(value):
     102,54 -> 102.54
     1.230,00 -> 1230.00
     1.230 -> 1230
-    1230.00 -> 1230.00
+    951.00 -> 951.00
     """
     if value in (None, ""):
         return ""
@@ -158,7 +158,7 @@ def parse_decimal_eu(value):
         s = s.replace(",", ".")
     elif "." in s:
         parts = s.split(".")
-        if len(parts) == 2 and len(parts[1]) in (1, 2):
+        if len(parts) == 2 and len(parts[1]) == 2:
             pass
         else:
             s = s.replace(".", "")
@@ -180,6 +180,55 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
     return text
 
 
+def find_invoice_number(text: str):
+    m = re.search(r"FACTUURNUMMER\s+([0-9]{5,})", text, re.IGNORECASE)
+    return m.group(1) if m else ""
+
+
+def find_invoice_date(text: str):
+    m = re.search(r"FACTUURDATUM\s+([0-9]{2}-[A-Za-z]{3}-[0-9]{4})", text, re.IGNORECASE)
+    return m.group(1) if m else ""
+
+
+def find_awb(text: str):
+    m = re.search(r"\b\d{3}-\d{8}\b", text)
+    return m.group(0) if m else ""
+
+
+def find_kg(text: str):
+    """
+    Beste bron: getal vóór 'kgs'
+    Voorbeeld:
+    Handling (Charges/Fee) 951.00 kgs 0 % EUR 218,73
+    -> 951 kg
+
+    Fallback:
+    35 COLLI E-commerce 951 951,00
+    -> 951 kg
+    """
+    kg_patterns = [
+        r"([0-9\.,]+)\s*kgs",
+        r"([0-9\.,]+)\s*KG\b",
+    ]
+
+    for pattern in kg_patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            return parse_decimal_eu(m.group(1))
+
+    fallback_patterns = [
+        r"\d+\s+COLLI\s+E-?commerce\s+([0-9\.,]+)\s+[0-9\.,]+",
+        r"\d+\s+COLLI\s+E-?COMMERCE\s+([0-9\.,]+)\s+[0-9\.,]+",
+    ]
+
+    for pattern in fallback_patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            return parse_decimal_eu(m.group(1))
+
+    return ""
+
+
 def find_charge(text: str):
     patterns = [
         r"(Import warehouse charges)\s+.*?EUR\s+([0-9\.,]+)",
@@ -190,28 +239,11 @@ def find_charge(text: str):
     ]
 
     for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-        if match:
-            return match.group(1), parse_decimal_eu(match.group(2))
+        m = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+        if m:
+            return m.group(1), parse_decimal_eu(m.group(2))
 
     return "", ""
-
-
-def find_kg(text: str):
-    patterns = [
-        r"\bCOLLI\b.*?E-?commerce\s+([0-9\.,]+)\s+[0-9\.,]+",
-        r"\bCOLLI\b.*?([0-9\.,]+)\s+([0-9\.,]+)",
-        r"\bBRUTO\b.*?([0-9\.,]+)",
-        r"([0-9\.,]+)\s*KG\b",
-        r"([0-9\.,]+)\s*kgs\b",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-        if match:
-            return parse_decimal_eu(match.group(1))
-
-    return ""
 
 
 def extract_pdf_data(pdf_bytes: bytes):
@@ -229,22 +261,9 @@ def extract_pdf_data(pdf_bytes: bytes):
     try:
         text = extract_pdf_text(pdf_bytes)
 
-        invoice_match = re.search(r"FACTUURNUMMER\s+([0-9]{5,})", text, re.IGNORECASE)
-        if invoice_match:
-            result["Factuurnummer"] = invoice_match.group(1)
-
-        date_match = re.search(
-            r"FACTUURDATUM\s+([0-9]{2}-[A-Za-z]{3}-[0-9]{4})",
-            text,
-            re.IGNORECASE,
-        )
-        if date_match:
-            result["Factuurdatum"] = date_match.group(1)
-
-        awb_match = re.search(r"\b\d{3}-\d{8}\b", text)
-        if awb_match:
-            result["AWB"] = awb_match.group(0)
-
+        result["Factuurnummer"] = find_invoice_number(text)
+        result["Factuurdatum"] = find_invoice_date(text)
+        result["AWB"] = find_awb(text)
         result["KG"] = find_kg(text)
 
         charge_name, charge_value = find_charge(text)
