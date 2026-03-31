@@ -31,7 +31,7 @@ SCOPES = [
 ]
 
 TARGET_SENDER = "s.gasior@missionfreight.nl"
-TARGET_FOLDER_PATH = ["Postvak IN", "Submap", "facturen verwerkt"]
+TARGET_FOLDER_PATH = ["Inbox", "facturen verwerkt"]
 
 
 @app.route("/")
@@ -135,6 +135,7 @@ def extract_pdf_data(pdf_bytes):
         "KG": "",
         "Charges": "",
         "Prijs_per_KG": "",
+        "Status": "",
     }
 
     if pdfplumber is None:
@@ -152,10 +153,13 @@ def extract_pdf_data(pdf_bytes):
         result["Status"] = f"PDF leesfout: {e}"
         return result
 
+    # AWB
     awb_match = re.search(r"\b\d{3}-\d{8}\b", text)
 
+    # KG
     kg_match = re.search(r"(\d+(?:[.,]\d+)?)\s*KG\b", text, re.IGNORECASE)
 
+    # Charges / handling fee / warehouse import charges
     charge_match = re.search(
         r"(handling charges|handling fee|warehouse import charges|import warehouse charges).*?(\d+(?:[.,]\d+)?)",
         text,
@@ -166,12 +170,10 @@ def extract_pdf_data(pdf_bytes):
         result["AWB"] = awb_match.group(0)
 
     if kg_match:
-        kg = float(kg_match.group(1).replace(",", "."))
-        result["KG"] = kg
+        result["KG"] = float(kg_match.group(1).replace(",", "."))
 
     if charge_match:
-        charges = float(charge_match.group(2).replace(",", "."))
-        result["Charges"] = charges
+        result["Charges"] = float(charge_match.group(2).replace(",", "."))
 
     if result["KG"] and result["Charges"]:
         result["Prijs_per_KG"] = round(result["Charges"] / result["KG"], 4)
@@ -188,11 +190,11 @@ def fetch_mails():
     folder_id = find_folder_by_path(TARGET_FOLDER_PATH)
 
     if not folder_id:
-        return "Map 'Postvak IN > Submap > facturen verwerkt' niet gevonden"
+        return "Map 'Inbox > facturen verwerkt' niet gevonden"
 
     messages_url = (
         f"{GRAPH_API}/me/mailFolders/{folder_id}/messages"
-        "?$top=50"
+        "?$top=100"
         "&$select=id,subject,receivedDateTime,from,hasAttachments"
     )
     messages_data = graph_get(messages_url)
@@ -249,7 +251,7 @@ def fetch_mails():
             )
 
     if not rows:
-        return "Geen PDF facturen gevonden van s.gasior@missionfreight.nl in 'Postvak IN > Submap > facturen verwerkt'"
+        return "Geen PDF facturen gevonden van s.gasior@missionfreight.nl in 'Inbox > facturen verwerkt'"
 
     df = pd.DataFrame(rows)
 
