@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import json
 import base64
 from urllib.parse import urlencode
 
@@ -40,7 +41,8 @@ MAX_LIMIT = 50
 
 @app.route("/")
 def home():
-    return """
+    total_rows = len(session.get("collected_rows", []))
+    return f"""
     <html>
       <head>
         <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -49,9 +51,12 @@ def home():
       <body style="font-family: Arial, sans-serif; padding: 24px;">
         <h2>Outlook PDF Tool</h2>
         <p><a href="/login">Login met Outlook</a></p>
-        <p><a href="/fetch-mails">Haal facturen op</a></p>
-        <p><a href="/fetch-mails?limit=20">Haal 20 facturen op</a></p>
-        <p><a href="/fetch-mails?limit=50">Haal 50 facturen op</a></p>
+        <p><a href="/fetch-batch?page=1&limit=20">Verwerk batch 1</a></p>
+        <p><a href="/fetch-batch?page=2&limit=20">Verwerk batch 2</a></p>
+        <p><a href="/fetch-batch?page=3&limit=20">Verwerk batch 3</a></p>
+        <p><a href="/download-excel">Download Excel</a></p>
+        <p><a href="/reset-batches">Reset verzamelde data</a></p>
+        <p>Verzamelde rijen: <strong>{total_rows}</strong></p>
       </body>
     </html>
     """
@@ -103,7 +108,7 @@ def callback():
     if "refresh_token" in token_json:
         session["refresh_token"] = token_json["refresh_token"]
 
-    return "Login succesvol ✅ Ga nu naar /fetch-mails"
+    return "Login succesvol ✅ Ga nu naar /fetch-batch?page=1&limit=20"
 
 
 def get_headers():
@@ -139,13 +144,6 @@ def find_folder_under_inbox(folder_name: str):
 
 
 def parse_decimal_eu(value):
-    """
-    Europese notatie:
-    102,54 -> 102.54
-    1.230,00 -> 1230.00
-    1.230 -> 1230
-    951.00 -> 951.00
-    """
     if value in (None, ""):
         return ""
 
@@ -196,21 +194,10 @@ def find_awb(text: str):
 
 
 def find_kg(text: str):
-    """
-    Beste bron: getal vóór 'kgs'
-    Voorbeeld:
-    Handling (Charges/Fee) 951.00 kgs 0 % EUR 218,73
-    -> 951 kg
-
-    Fallback:
-    35 COLLI E-commerce 951 951,00
-    -> 951 kg
-    """
     kg_patterns = [
         r"([0-9\.,]+)\s*kgs",
         r"([0-9\.,]+)\s*KG\b",
     ]
-
     for pattern in kg_patterns:
         m = re.search(pattern, text, re.IGNORECASE)
         if m:
@@ -220,7 +207,6 @@ def find_kg(text: str):
         r"\d+\s+COLLI\s+E-?commerce\s+([0-9\.,]+)\s+[0-9\.,]+",
         r"\d+\s+COLLI\s+E-?COMMERCE\s+([0-9\.,]+)\s+[0-9\.,]+",
     ]
-
     for pattern in fallback_patterns:
         m = re.search(pattern, text, re.IGNORECASE)
         if m:
@@ -291,8 +277,8 @@ def extract_pdf_data(pdf_bytes: bytes):
         return result
 
 
-@app.route("/fetch-mails")
-def fetch_mails():
+@app.route("/fetch-batch")
+def fetch_batch():
     try:
         if "access_token" not in session:
             return redirect("/login")
@@ -302,10 +288,19 @@ def fetch_mails():
         except Exception:
             limit = DEFAULT_LIMIT
 
+        try:
+            page = int(request.args.get("page", 1))
+        except Exception:
+            page = 1
+
         if limit < 1:
             limit = DEFAULT_LIMIT
         if limit > MAX_LIMIT:
             limit = MAX_LIMIT
+        if page < 1:
+            page = 1
+
+        skip = (page - 1) * limit
 
         folder_id = find_folder_under_inbox(TARGET_FOLDER_NAME)
         if not folder_id:
@@ -314,6 +309,7 @@ def fetch_mails():
         messages_url = (
             f"{GRAPH_API}/me/mailFolders/{folder_id}/messages"
             f"?$top={limit}"
+            f"&$skip={skip}"
             "&$select=id,subject,receivedDateTime,from,hasAttachments"
             "&$orderby=receivedDateTime desc"
         )
@@ -321,7 +317,7 @@ def fetch_mails():
         messages_data = graph_get(messages_url)
         messages = messages_data.get("value", [])
 
-        rows = []
+        batch_rows = []
 
         for mail in messages:
             sender = (
@@ -358,8 +354,9 @@ def fetch_mails():
                 pdf_bytes = base64.b64decode(content_b64)
                 parsed = extract_pdf_data(pdf_bytes)
 
-                rows.append(
+                batch_rows.append(
                     {
+                        "Pagina": page,
                         "Datum email": mail.get("receivedDateTime", ""),
                         "Afzender": sender,
                         "Onderwerp": mail.get("subject", ""),
@@ -375,31 +372,52 @@ def fetch_mails():
                     }
                 )
 
-        if not rows:
-            return (
-                f"Geen PDF facturen gevonden van {TARGET_SENDER} "
-                f"in map 'Inbox > {TARGET_FOLDER_NAME}'"
-            )
+        existing_rows = session.get("collected_rows", [])
+        combined_rows = existing_rows + batch_rows
 
-        df = pd.DataFrame(rows)
-
-        if "Factuurnummer" in df.columns:
+        if combined_rows:
+            df = pd.DataFrame(combined_rows)
             df = df.sort_values(by=["Datum email"], ascending=False)
             df = df.drop_duplicates(subset=["Factuurnummer", "Bestandsnaam"], keep="first")
+            session["collected_rows"] = df.to_dict(orient="records")
+        else:
+            session["collected_rows"] = []
 
-        output = io.BytesIO()
-        df.to_excel(output, index=False, engine="openpyxl")
-        output.seek(0)
-
-        return send_file(
-            output,
-            download_name="outlook_facturen.xlsx",
-            as_attachment=True,
-            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        return (
+            f"Batch {page} verwerkt ✅ "
+            f"Toegevoegd: {len(batch_rows)} rijen. "
+            f"Totaal verzameld: {len(session.get('collected_rows', []))}. "
+            f"Ga nu naar /download-excel of verwerk volgende batch."
         )
 
     except Exception as e:
-        return f"Fout in fetch-mails: {e}", 500
+        return f"Fout in fetch-batch: {e}", 500
+
+
+@app.route("/download-excel")
+def download_excel():
+    rows = session.get("collected_rows", [])
+
+    if not rows:
+        return "Nog geen batches verwerkt. Gebruik eerst /fetch-batch?page=1&limit=20"
+
+    df = pd.DataFrame(rows)
+    output = io.BytesIO()
+    df.to_excel(output, index=False, engine="openpyxl")
+    output.seek(0)
+
+    return send_file(
+        output,
+        download_name="outlook_facturen_all_batches.xlsx",
+        as_attachment=True,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.route("/reset-batches")
+def reset_batches():
+    session["collected_rows"] = []
+    return "Verzamelde batch-data is gereset ✅"
 
 
 @app.route("/health")
