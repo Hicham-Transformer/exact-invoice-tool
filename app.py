@@ -16,9 +16,6 @@ except Exception:
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "supersecret-dev-key")
 
-# =========================
-# CONFIG
-# =========================
 CLIENT_ID = os.environ.get("MS_CLIENT_ID")
 CLIENT_SECRET = os.environ.get("MS_CLIENT_SECRET")
 REDIRECT_URI = os.environ.get("MS_REDIRECT_URI")
@@ -41,9 +38,6 @@ DEFAULT_LIMIT = 20
 MAX_LIMIT = 50
 
 
-# =========================
-# HOME
-# =========================
 @app.route("/")
 def home():
     return """
@@ -64,9 +58,6 @@ def home():
     """
 
 
-# =========================
-# LOGIN
-# =========================
 @app.route("/login")
 def login():
     if not CLIENT_ID or not CLIENT_SECRET or not REDIRECT_URI:
@@ -116,9 +107,6 @@ def callback():
     return "Login succesvol ✅ Ga nu naar /fetch-mails"
 
 
-# =========================
-# HELPERS
-# =========================
 def get_headers():
     token = session.get("access_token")
     if not token:
@@ -151,12 +139,34 @@ def find_folder_under_inbox(folder_name: str):
     return None
 
 
-def parse_decimal(value):
+def parse_decimal_eu(value):
+    """
+    Europese notatie:
+    102,54 -> 102.54
+    1.230,00 -> 1230.00
+    1.230 -> 1230
+    """
     if value in (None, ""):
         return ""
-    text = str(value).strip().replace(".", "").replace(",", ".")
+
+    s = str(value).strip().replace("EUR", "").replace("kgs", "").replace("kg", "").strip()
+
+    # zowel punt als komma aanwezig -> punt is duizendtallen, komma is decimalen
+    if "." in s and "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    # alleen komma -> decimaal
+    elif "," in s:
+        s = s.replace(",", ".")
+    # alleen punt -> vaak duizendtallen, behalve als precies 1-2 decimalen
+    elif "." in s:
+        parts = s.split(".")
+        if len(parts) == 2 and len(parts[1]) in (1, 2):
+            pass
+        else:
+            s = s.replace(".", "")
+
     try:
-        return float(text)
+        return float(s)
     except Exception:
         return ""
 
@@ -174,31 +184,35 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
 
 def find_charge(text: str):
     patterns = [
-        r"(Import warehouse charges)\s+.*?EUR\s+(\d+(?:[.,]\d+)?)",
-        r"(Handling fee)\s+.*?EUR\s+(\d+(?:[.,]\d+)?)",
-        r"(Handling charges)\s+.*?EUR\s+(\d+(?:[.,]\d+)?)",
+        r"(Import warehouse charges)\s+.*?EUR\s+([0-9\.,]+)",
+        r"(Handling fee)\s+.*?EUR\s+([0-9\.,]+)",
+        r"(Handling charges)\s+.*?EUR\s+([0-9\.,]+)",
+        r"(Handling\s*\(Charges/Fee\))\s+.*?EUR\s+([0-9\.,]+)",
+        r"(Handling)\s+.*?EUR\s+([0-9\.,]+)",
     ]
 
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
         if match:
-            return match.group(1), parse_decimal(match.group(2))
+            return match.group(1), parse_decimal_eu(match.group(2))
 
     return "", ""
 
 
 def find_kg(text: str):
     patterns = [
-        r"\bCOLLI\b.*?E-COMMERCE\s+(\d+(?:[.,]\d+)?)\s+\d+(?:[.,]\d+)?",
-        r"\bCOLLI\b.*?(\d+(?:[.,]\d+)?)\s+(\d+(?:[.,]\d+)?)",
-        r"\bBRUTO\b.*?(\d+(?:[.,]\d+)?)",
-        r"(\d+(?:[.,]\d+)?)\s*KG\b",
+        # voorbeeld: "1 COLLI E-commerce 1.230 1.230,00"
+        r"\bCOLLI\b.*?E-?commerce\s+([0-9\.,]+)\s+[0-9\.,]+",
+        # fallback
+        r"\bBRUTO\b.*?([0-9\.,]+)",
+        r"([0-9\.,]+)\s*KG\b",
+        r"([0-9\.,]+)\s*kgs\b",
     ]
 
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
         if match:
-            return parse_decimal(match.group(1))
+            return parse_decimal_eu(match.group(1))
 
     return ""
 
@@ -261,9 +275,6 @@ def extract_pdf_data(pdf_bytes: bytes):
         return result
 
 
-# =========================
-# FETCH MAILS
-# =========================
 @app.route("/fetch-mails")
 def fetch_mails():
     try:
