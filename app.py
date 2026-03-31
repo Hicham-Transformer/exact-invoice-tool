@@ -52,7 +52,6 @@ def home():
         <p><a href="/fetch-mails">Haal facturen op</a></p>
         <p><a href="/fetch-mails?limit=20">Haal 20 facturen op</a></p>
         <p><a href="/fetch-mails?limit=50">Haal 50 facturen op</a></p>
-        <p><a href="/health">Health check</a></p>
       </body>
     </html>
     """
@@ -145,19 +144,18 @@ def parse_decimal_eu(value):
     102,54 -> 102.54
     1.230,00 -> 1230.00
     1.230 -> 1230
+    1230.00 -> 1230.00
     """
     if value in (None, ""):
         return ""
 
-    s = str(value).strip().replace("EUR", "").replace("kgs", "").replace("kg", "").strip()
+    s = str(value).strip()
+    s = s.replace("EUR", "").replace("kgs", "").replace("kg", "").strip()
 
-    # zowel punt als komma aanwezig -> punt is duizendtallen, komma is decimalen
     if "." in s and "," in s:
         s = s.replace(".", "").replace(",", ".")
-    # alleen komma -> decimaal
     elif "," in s:
         s = s.replace(",", ".")
-    # alleen punt -> vaak duizendtallen, behalve als precies 1-2 decimalen
     elif "." in s:
         parts = s.split(".")
         if len(parts) == 2 and len(parts[1]) in (1, 2):
@@ -201,9 +199,8 @@ def find_charge(text: str):
 
 def find_kg(text: str):
     patterns = [
-        # voorbeeld: "1 COLLI E-commerce 1.230 1.230,00"
         r"\bCOLLI\b.*?E-?commerce\s+([0-9\.,]+)\s+[0-9\.,]+",
-        # fallback
+        r"\bCOLLI\b.*?([0-9\.,]+)\s+([0-9\.,]+)",
         r"\bBRUTO\b.*?([0-9\.,]+)",
         r"([0-9\.,]+)\s*KG\b",
         r"([0-9\.,]+)\s*kgs\b",
