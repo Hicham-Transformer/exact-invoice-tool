@@ -16,6 +16,9 @@ except Exception:
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "supersecret-dev-key")
 
+# =========================
+# CONFIG
+# =========================
 CLIENT_ID = os.environ.get("MS_CLIENT_ID")
 CLIENT_SECRET = os.environ.get("MS_CLIENT_SECRET")
 REDIRECT_URI = os.environ.get("MS_REDIRECT_URI")
@@ -34,7 +37,13 @@ SCOPES = [
 TARGET_FOLDER_NAME = "facturen verwerkt"
 TARGET_SENDER = "s.gasior@missionfreight.nl"
 
+DEFAULT_LIMIT = 20
+MAX_LIMIT = 50
 
+
+# =========================
+# HOME
+# =========================
 @app.route("/")
 def home():
     return """
@@ -47,11 +56,17 @@ def home():
         <h2>Outlook PDF Tool</h2>
         <p><a href="/login">Login met Outlook</a></p>
         <p><a href="/fetch-mails">Haal facturen op</a></p>
+        <p><a href="/fetch-mails?limit=20">Haal 20 facturen op</a></p>
+        <p><a href="/fetch-mails?limit=50">Haal 50 facturen op</a></p>
+        <p><a href="/health">Health check</a></p>
       </body>
     </html>
     """
 
 
+# =========================
+# LOGIN
+# =========================
 @app.route("/login")
 def login():
     if not CLIENT_ID or not CLIENT_SECRET or not REDIRECT_URI:
@@ -101,6 +116,9 @@ def callback():
     return "Login succesvol ✅ Ga nu naar /fetch-mails"
 
 
+# =========================
+# HELPERS
+# =========================
 def get_headers():
     token = session.get("access_token")
     if not token:
@@ -110,40 +128,35 @@ def get_headers():
 
 def graph_get(url: str):
     response = requests.get(url, headers=get_headers(), timeout=30)
-    data = response.json()
+    try:
+        data = response.json()
+    except Exception:
+        raise RuntimeError(f"Graph response niet leesbaar: HTTP {response.status_code} - {response.text}")
+
     if response.status_code != 200:
         raise RuntimeError(f"Graph fout {response.status_code}: {data}")
+
     return data
-
-
-def graph_get_all(url: str):
-    items = []
-    while url:
-        data = graph_get(url)
-        items.extend(data.get("value", []))
-        url = data.get("@odata.nextLink")
-    return items
 
 
 def find_folder_under_inbox(folder_name: str):
     folder_name = folder_name.strip().lower()
     url = f"{GRAPH_API}/me/mailFolders/inbox/childFolders?$top=200"
-    folders = graph_get_all(url)
+    data = graph_get(url)
 
-    for folder in folders:
+    for folder in data.get("value", []):
         if (folder.get("displayName") or "").strip().lower() == folder_name:
             return folder["id"]
 
     return None
 
 
-def parse_decimal(text):
-    if not text:
+def parse_decimal(value):
+    if value in (None, ""):
         return ""
-    value = str(text).strip()
-    value = value.replace(".", "").replace(",", ".")
+    text = str(value).strip().replace(".", "").replace(",", ".")
     try:
-        return float(value)
+        return float(text)
     except Exception:
         return ""
 
@@ -175,15 +188,14 @@ def find_charge(text: str):
 
 
 def find_kg(text: str):
-    # patroon zoals in jouw voorbeeld
-    goods_patterns = [
+    patterns = [
         r"\bCOLLI\b.*?E-COMMERCE\s+(\d+(?:[.,]\d+)?)\s+\d+(?:[.,]\d+)?",
-        r"\bCOLLI\b.*?\bBRUTO\b.*?(\d+(?:[.,]\d+)?)",
+        r"\bCOLLI\b.*?(\d+(?:[.,]\d+)?)\s+(\d+(?:[.,]\d+)?)",
         r"\bBRUTO\b.*?(\d+(?:[.,]\d+)?)",
         r"(\d+(?:[.,]\d+)?)\s*KG\b",
     ]
 
-    for pattern in goods_patterns:
+    for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
         if match:
             return parse_decimal(match.group(1))
@@ -249,24 +261,38 @@ def extract_pdf_data(pdf_bytes: bytes):
         return result
 
 
+# =========================
+# FETCH MAILS
+# =========================
 @app.route("/fetch-mails")
 def fetch_mails():
     try:
         if "access_token" not in session:
             return redirect("/login")
 
+        try:
+            limit = int(request.args.get("limit", DEFAULT_LIMIT))
+        except Exception:
+            limit = DEFAULT_LIMIT
+
+        if limit < 1:
+            limit = DEFAULT_LIMIT
+        if limit > MAX_LIMIT:
+            limit = MAX_LIMIT
+
         folder_id = find_folder_under_inbox(TARGET_FOLDER_NAME)
         if not folder_id:
             return "Map 'Inbox > facturen verwerkt' niet gevonden"
 
-        # haalt ALLE mails op via nextLink pagination
         messages_url = (
             f"{GRAPH_API}/me/mailFolders/{folder_id}/messages"
-            "?$top=100"
+            f"?$top={limit}"
             "&$select=id,subject,receivedDateTime,from,hasAttachments"
             "&$orderby=receivedDateTime desc"
         )
-        messages = graph_get_all(messages_url)
+
+        messages_data = graph_get(messages_url)
+        messages = messages_data.get("value", [])
 
         rows = []
 
@@ -286,8 +312,9 @@ def fetch_mails():
                 continue
 
             msg_id = mail["id"]
-            attachments_url = f"{GRAPH_API}/me/messages/{msg_id}/attachments?$top=100"
-            attachments = graph_get_all(attachments_url)
+            attachments_url = f"{GRAPH_API}/me/messages/{msg_id}/attachments?$top=50"
+            attachments_data = graph_get(attachments_url)
+            attachments = attachments_data.get("value", [])
 
             for att in attachments:
                 if att.get("@odata.type") != "#microsoft.graph.fileAttachment":
@@ -322,11 +349,13 @@ def fetch_mails():
                 )
 
         if not rows:
-            return "Geen PDF facturen gevonden van s.gasior@missionfreight.nl in map 'Inbox > facturen verwerkt'"
+            return (
+                f"Geen PDF facturen gevonden van {TARGET_SENDER} "
+                f"in map 'Inbox > {TARGET_FOLDER_NAME}'"
+            )
 
         df = pd.DataFrame(rows)
 
-        # dubbele pdf’s / dubbele factuurnummers verminderen
         if "Factuurnummer" in df.columns:
             df = df.sort_values(by=["Datum email"], ascending=False)
             df = df.drop_duplicates(subset=["Factuurnummer", "Bestandsnaam"], keep="first")
