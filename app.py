@@ -37,6 +37,7 @@ TARGET_SENDER = "s.gasior@missionfreight.nl"
 DEFAULT_LIMIT = 20
 MAX_LIMIT = 50
 DEFAULT_PAGE = 1
+MAX_FETCH_MESSAGES = 200
 
 
 @app.route("/")
@@ -116,7 +117,7 @@ def get_headers():
 
 
 def graph_get(url: str):
-    response = requests.get(url, headers=get_headers(), timeout=30)
+    response = requests.get(url, headers=get_headers(), timeout=60)
     try:
         data = response.json()
     except Exception:
@@ -297,22 +298,23 @@ def fetch_batch():
         if page < 1:
             page = DEFAULT_PAGE
 
-        skip = (page - 1) * limit
-
         folder_id = find_folder_under_inbox(TARGET_FOLDER_NAME)
         if not folder_id:
             return "Map 'Inbox > facturen verwerkt' niet gevonden"
 
         messages_url = (
             f"{GRAPH_API}/me/mailFolders/{folder_id}/messages"
-            f"?$top={limit}"
-            f"&$skip={skip}"
+            f"?$top={MAX_FETCH_MESSAGES}"
             "&$select=id,subject,receivedDateTime,from,hasAttachments"
             "&$orderby=receivedDateTime asc"
         )
 
         messages_data = graph_get(messages_url)
-        messages = messages_data.get("value", [])
+        all_messages = messages_data.get("value", [])
+
+        start = (page - 1) * limit
+        end = start + limit
+        messages = all_messages[start:end]
 
         rows = []
 
