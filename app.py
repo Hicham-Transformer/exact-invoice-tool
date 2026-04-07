@@ -32,7 +32,10 @@ SCOPES = [
 ]
 
 TARGET_FOLDER_NAME = "facturen verwerkt"
-TARGET_SENDER = "s.gasior@missionfreight.nl"
+SENDER_MATCHES = [
+    "s.gasior@missionfreight.nl",
+    "missionfreight",
+]
 
 DEFAULT_LIMIT = 20
 MAX_LIMIT = 50
@@ -51,9 +54,9 @@ def home():
       <body style="font-family: Arial, sans-serif; padding: 24px;">
         <h2>Outlook PDF Tool</h2>
         <p><a href="/login">Login met Outlook</a></p>
-        <p><a href="/fetch-batch?page=1&limit=20">Batch 1 (oudste 20 relevante facturen)</a></p>
-        <p><a href="/fetch-batch?page=2&limit=20">Batch 2 (volgende 20 relevante facturen)</a></p>
-        <p><a href="/fetch-batch?page=3&limit=20">Batch 3 (volgende 20 relevante facturen)</a></p>
+        <p><a href="/fetch-batch?page=1&limit=20">Batch 1 (eerste 20 Sandra/Mission Freight PDF-mails)</a></p>
+        <p><a href="/fetch-batch?page=2&limit=20">Batch 2 (volgende 20 Sandra/Mission Freight PDF-mails)</a></p>
+        <p><a href="/fetch-batch?page=3&limit=20">Batch 3 (volgende 20 Sandra/Mission Freight PDF-mails)</a></p>
         <p><a href="/health">Health check</a></p>
       </body>
     </html>
@@ -121,7 +124,9 @@ def graph_get(url: str):
     try:
         data = response.json()
     except Exception:
-        raise RuntimeError(f"Graph response niet leesbaar: HTTP {response.status_code} - {response.text}")
+        raise RuntimeError(
+            f"Graph response niet leesbaar: HTTP {response.status_code} - {response.text}"
+        )
 
     if response.status_code != 200:
         raise RuntimeError(f"Graph fout {response.status_code}: {data}")
@@ -275,19 +280,6 @@ def extract_pdf_data(pdf_bytes: bytes):
         return result
 
 
-def has_pdf_attachment(message_id: str):
-    attachments_url = f"{GRAPH_API}/me/messages/{message_id}/attachments?$top=50"
-    attachments_data = graph_get(attachments_url)
-    attachments = attachments_data.get("value", [])
-
-    for att in attachments:
-        if att.get("@odata.type") == "#microsoft.graph.fileAttachment":
-            filename = att.get("name", "")
-            if filename.lower().endswith(".pdf"):
-                return True
-    return False
-
-
 def get_pdf_attachments(message_id: str):
     attachments_url = f"{GRAPH_API}/me/messages/{message_id}/attachments?$top=50"
     attachments_data = graph_get(attachments_url)
@@ -312,6 +304,11 @@ def get_pdf_attachments(message_id: str):
         })
 
     return pdfs
+
+
+def sender_matches(sender: str) -> bool:
+    sender = (sender or "").strip().lower()
+    return any(match in sender for match in SENDER_MATCHES)
 
 
 @app.route("/fetch-batch")
@@ -351,7 +348,6 @@ def fetch_batch():
         messages_data = graph_get(messages_url)
         all_messages = messages_data.get("value", [])
 
-        # eerst filteren op relevante mails
         relevant_messages = []
         for mail in all_messages:
             sender = (
@@ -362,15 +358,20 @@ def fetch_batch():
                 .lower()
             )
 
-            if TARGET_SENDER not in sender:
+            if not sender_matches(sender):
                 continue
 
             if not mail.get("hasAttachments"):
                 continue
 
             msg_id = mail["id"]
-            if has_pdf_attachment(msg_id):
-                relevant_messages.append(mail)
+
+            try:
+                pdfs = get_pdf_attachments(msg_id)
+                if pdfs:
+                    relevant_messages.append(mail)
+            except Exception:
+                continue
 
         start = (page - 1) * limit
         end = start + limit
@@ -414,7 +415,7 @@ def fetch_batch():
         if not rows:
             total_relevant = len(relevant_messages)
             return (
-                f"Geen PDF facturen gevonden op pagina {page}. "
+                f"Geen Sandra/Mission Freight PDF facturen gevonden op pagina {page}. "
                 f"Totaal relevante mails gevonden: {total_relevant}"
             )
 
@@ -428,7 +429,7 @@ def fetch_batch():
 
         return send_file(
             output,
-            download_name=f"outlook_facturen_batch_{page}.xlsx",
+            download_name=f"missionfreight_facturen_batch_{page}.xlsx",
             as_attachment=True,
             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
