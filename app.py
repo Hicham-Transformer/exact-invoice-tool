@@ -51,9 +51,9 @@ def home():
       <body style="font-family: Arial, sans-serif; padding: 24px;">
         <h2>Outlook PDF Tool</h2>
         <p><a href="/login">Login met Outlook</a></p>
-        <p><a href="/fetch-batch?page=1&limit=20">Batch 1 (oudste 20)</a></p>
-        <p><a href="/fetch-batch?page=2&limit=20">Batch 2 (volgende 20)</a></p>
-        <p><a href="/fetch-batch?page=3&limit=20">Batch 3 (volgende 20)</a></p>
+        <p><a href="/fetch-batch?page=1&limit=20">Batch 1 (oudste 20 relevante facturen)</a></p>
+        <p><a href="/fetch-batch?page=2&limit=20">Batch 2 (volgende 20 relevante facturen)</a></p>
+        <p><a href="/fetch-batch?page=3&limit=20">Batch 3 (volgende 20 relevante facturen)</a></p>
         <p><a href="/health">Health check</a></p>
       </body>
     </html>
@@ -275,6 +275,45 @@ def extract_pdf_data(pdf_bytes: bytes):
         return result
 
 
+def has_pdf_attachment(message_id: str):
+    attachments_url = f"{GRAPH_API}/me/messages/{message_id}/attachments?$top=50"
+    attachments_data = graph_get(attachments_url)
+    attachments = attachments_data.get("value", [])
+
+    for att in attachments:
+        if att.get("@odata.type") == "#microsoft.graph.fileAttachment":
+            filename = att.get("name", "")
+            if filename.lower().endswith(".pdf"):
+                return True
+    return False
+
+
+def get_pdf_attachments(message_id: str):
+    attachments_url = f"{GRAPH_API}/me/messages/{message_id}/attachments?$top=50"
+    attachments_data = graph_get(attachments_url)
+    attachments = attachments_data.get("value", [])
+
+    pdfs = []
+    for att in attachments:
+        if att.get("@odata.type") != "#microsoft.graph.fileAttachment":
+            continue
+
+        filename = att.get("name", "")
+        if not filename.lower().endswith(".pdf"):
+            continue
+
+        content_b64 = att.get("contentBytes")
+        if not content_b64:
+            continue
+
+        pdfs.append({
+            "filename": filename,
+            "pdf_bytes": base64.b64decode(content_b64),
+        })
+
+    return pdfs
+
+
 @app.route("/fetch-batch")
 def fetch_batch():
     try:
@@ -312,13 +351,9 @@ def fetch_batch():
         messages_data = graph_get(messages_url)
         all_messages = messages_data.get("value", [])
 
-        start = (page - 1) * limit
-        end = start + limit
-        messages = all_messages[start:end]
-
-        rows = []
-
-        for mail in messages:
+        # eerst filteren op relevante mails
+        relevant_messages = []
+        for mail in all_messages:
             sender = (
                 mail.get("from", {})
                 .get("emailAddress", {})
@@ -334,24 +369,29 @@ def fetch_batch():
                 continue
 
             msg_id = mail["id"]
-            attachments_url = f"{GRAPH_API}/me/messages/{msg_id}/attachments?$top=50"
-            attachments_data = graph_get(attachments_url)
-            attachments = attachments_data.get("value", [])
+            if has_pdf_attachment(msg_id):
+                relevant_messages.append(mail)
 
-            for att in attachments:
-                if att.get("@odata.type") != "#microsoft.graph.fileAttachment":
-                    continue
+        start = (page - 1) * limit
+        end = start + limit
+        messages = relevant_messages[start:end]
 
-                filename = att.get("name", "")
-                if not filename.lower().endswith(".pdf"):
-                    continue
+        rows = []
 
-                content_b64 = att.get("contentBytes")
-                if not content_b64:
-                    continue
+        for mail in messages:
+            sender = (
+                mail.get("from", {})
+                .get("emailAddress", {})
+                .get("address", "")
+                .strip()
+                .lower()
+            )
 
-                pdf_bytes = base64.b64decode(content_b64)
-                parsed = extract_pdf_data(pdf_bytes)
+            msg_id = mail["id"]
+            pdf_attachments = get_pdf_attachments(msg_id)
+
+            for pdf in pdf_attachments:
+                parsed = extract_pdf_data(pdf["pdf_bytes"])
 
                 rows.append(
                     {
@@ -359,7 +399,7 @@ def fetch_batch():
                         "Datum email": mail.get("receivedDateTime", ""),
                         "Afzender": sender,
                         "Onderwerp": mail.get("subject", ""),
-                        "Bestandsnaam": filename,
+                        "Bestandsnaam": pdf["filename"],
                         "Factuurnummer": parsed.get("Factuurnummer", ""),
                         "Factuurdatum": parsed.get("Factuurdatum", ""),
                         "AWB": parsed.get("AWB", ""),
@@ -372,7 +412,11 @@ def fetch_batch():
                 )
 
         if not rows:
-            return f"Geen PDF facturen gevonden op pagina {page}"
+            total_relevant = len(relevant_messages)
+            return (
+                f"Geen PDF facturen gevonden op pagina {page}. "
+                f"Totaal relevante mails gevonden: {total_relevant}"
+            )
 
         df = pd.DataFrame(rows)
         df = df.sort_values(by=["Datum email"], ascending=True)
