@@ -50,7 +50,7 @@ def home():
       <body style="font-family: Arial, sans-serif; padding: 24px;">
         <h2>Outlook PDF Tool</h2>
         <p><a href="/login">Login met Outlook</a></p>
-        <p><a href="/fetch-batch?page=1&limit=20">Batch 1 (eerste 20)</a></p>
+        <p><a href="/fetch-batch?page=1&limit=20">Batch 1 (oudste 20)</a></p>
         <p><a href="/fetch-batch?page=2&limit=20">Batch 2 (volgende 20)</a></p>
         <p><a href="/fetch-batch?page=3&limit=20">Batch 3 (volgende 20)</a></p>
         <p><a href="/health">Health check</a></p>
@@ -308,7 +308,7 @@ def fetch_batch():
             f"?$top={limit}"
             f"&$skip={skip}"
             "&$select=id,subject,receivedDateTime,from,hasAttachments"
-            "&$orderby=receivedDateTime desc"
+            "&$orderby=receivedDateTime asc"
         )
 
         messages_data = graph_get(messages_url)
@@ -373,7 +373,7 @@ def fetch_batch():
             return f"Geen PDF facturen gevonden op pagina {page}"
 
         df = pd.DataFrame(rows)
-        df = df.sort_values(by=["Datum email"], ascending=False)
+        df = df.sort_values(by=["Datum email"], ascending=True)
         df = df.drop_duplicates(subset=["Factuurnummer", "Bestandsnaam"], keep="first")
 
         output = io.BytesIO()
